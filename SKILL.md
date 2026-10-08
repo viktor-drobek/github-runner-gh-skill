@@ -81,6 +81,7 @@ What a local runner manager can rely on when the helper runs it through `with-re
    ```bash
    repo=OWNER/REPOSITORY
    mode=ephemeral   # or persistent, exactly as the operator stated
+   labels=repository-build  # a narrow, purpose-specific custom label
    scripts/github-runner-gh --repo "$repo" permission
    scripts/github-runner-gh --repo "$repo" list
    ```
@@ -102,11 +103,11 @@ What a local runner manager can rely on when the helper runs it through `with-re
    case "$mode" in
      ephemeral)
        scripts/github-runner-gh --repo "$repo" with-registration-token \
-         "$RUNNERCTL" register --token-file {} --image "$RUNNER_IMAGE" --ephemeral --labels "$labels"
+         "$RUNNERCTL" register --repo "$repo" --token-file {} --image "$RUNNER_IMAGE" --ephemeral --labels "$labels"
        ;;
      persistent)
        scripts/github-runner-gh --repo "$repo" with-registration-token \
-         "$RUNNERCTL" register --token-file {} --image "$RUNNER_IMAGE" --labels "$labels"
+         "$RUNNERCTL" register --repo "$repo" --token-file {} --image "$RUNNER_IMAGE" --labels "$labels"
        ;;
    esac
    ```
@@ -170,6 +171,7 @@ What a local runner manager can rely on when the helper runs it through `with-re
 1. Stop new local work and identify the exact GitHub runner record.
 
    ```bash
+   slug=EXACT_RUNNER_SLUG  # printed by runnerctl register
    scripts/github-runner-gh --repo "$repo" list
    scripts/github-runner-gh --repo "$repo" get RUNNER_ID
    ```
@@ -179,7 +181,7 @@ What a local runner manager can rely on when the helper runs it through `with-re
    - Persistent: stop the runner through the reviewed manager, then hand it a removal token so it can unconfigure itself; the helper removes the token file when the manager exits.
 
      ```bash
-     scripts/github-runner-gh --repo "$repo" with-remove-token "$RUNNERCTL" remove --token-file {}
+     scripts/github-runner-gh --repo "$repo" with-remove-token "$RUNNERCTL" remove "$slug" --token-file {}
      ```
 
 3. Delete any remaining GitHub registration by ID and exact name. This is the required ghost-runner cleanup.
