@@ -1,6 +1,6 @@
 """Integration tests for the reference manager: a real Docker daemon and a real user systemd.
 
-Run by hand with `make integration`; never by `make test`. Requirements: Docker with the pinned runner image
+Run by hand with `make integration`; never by `make test`. Requirements: Docker with the `RUNNER_IMAGE` pinned runner image
 pulled, `systemd-run --user` available, and a scratch repository the operator names in
 RUNNERCTL_INTEGRATION_REPO with `gh` authenticated as an admin of it. `systemd-run --user` needs the user
 bus: in a desktop session whose bus address points elsewhere, export
@@ -23,13 +23,14 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNNERCTL = ROOT / "scripts" / "runnerctl"
 HELPER = ROOT / "scripts" / "github-runner-gh"
 REPO = os.environ.get("RUNNERCTL_INTEGRATION_REPO", "")
+RUNNER_IMAGE = os.environ.get("RUNNER_IMAGE", "")
 
 
 def run(*command: str, env: dict | None = None, timeout: float = 300, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(command, env={**os.environ, **(env or {})}, capture_output=True, text=True, timeout=timeout, check=check)
 
 
-@unittest.skipUnless(REPO, "set RUNNERCTL_INTEGRATION_REPO to OWNER/REPOSITORY of a scratch repository")
+@unittest.skipUnless(REPO and RUNNER_IMAGE, "set RUNNERCTL_INTEGRATION_REPO and RUNNER_IMAGE for a scratch repository")
 class RunnerctlIntegrationTest(unittest.TestCase):
     """Registers a persistent runner in the scratch repository, runs it under a transient user unit, stops the
     unit, and checks that the stop path completed before TimeoutStopSec, that GitHub answers 404 afterwards,
@@ -54,7 +55,7 @@ class RunnerctlIntegrationTest(unittest.TestCase):
         )
         try:
             registration = run(str(HELPER), "--repo", REPO, "with-registration-token", str(RUNNERCTL), "register", "--repo", REPO,
-                               "--labels", "integration", "--slug", self.slug, "--token-file", "{}", env=self.env)
+                               "--labels", "integration", "--image", RUNNER_IMAGE, "--slug", self.slug, "--token-file", "{}", env=self.env)
         finally:
             watcher.terminate()
             watched, _ = watcher.communicate()

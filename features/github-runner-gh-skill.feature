@@ -174,3 +174,8 @@ Feature: Manage repository-level self-hosted runners through GitHub CLI
     And the operator confirms an unconfirmed deletion with get RUNNER_ID, whose 404 message says "GitHub answers 404"
     And get, check, and delete explain a 404 the same way
     And the local runtime is removed separately
+
+  Scenario: Document complete manager commands
+    When the skill documents a runner registration handoff
+    Then the manager command carries the explicit repository, narrow custom labels, and a digest-pinned image
+    And the persistent removal handoff carries the exact registration slug

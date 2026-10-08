@@ -39,8 +39,11 @@ Decide with the operator whether the runner is ephemeral or persistent, then reg
 When using the included `runnerctl`, set `RUNNER_IMAGE` to the operator-selected compatible runner image. The manager requires a manifest digest and never supplies, builds, or updates an image itself.
 
 ```bash
-./scripts/github-runner-gh --repo OWNER/REPOSITORY with-registration-token \
-  "$RUNNERCTL" register --token-file {} --image "$RUNNER_IMAGE" --ephemeral --labels repository-build
+repo=OWNER/REPOSITORY
+labels=repository-build
+: "${RUNNERCTL:=./scripts/runnerctl}"
+./scripts/github-runner-gh --repo "$repo" with-registration-token \
+  "$RUNNERCTL" register --repo "$repo" --token-file {} --image "$RUNNER_IMAGE" --ephemeral --labels "$labels"
 ```
 
 [SKILL.md](SKILL.md) describes the persistent variant and the manual `registration-token-file` handoff for a manager that cannot take the path.
@@ -83,7 +86,7 @@ See [SKILL.md](SKILL.md) for the complete workflow and failure rules.
 
 ## Reference manager
 
-`scripts/runnerctl` registers, runs, verifies, and removes one runner per registration in a Docker container on Linux, under the systemd user unit template in `systemd/user/`. It reaches GitHub only through the helper, feeds the helper's token file to a short-lived configuration container on its standard input and answers `config.sh`'s prompt from it under a pseudo-terminal with echo off, supervises the listener as a notify service, and stops it through a bounded stop path of 75 seconds at most, phase by phase, under the unit's `TimeoutStopSec=90`. It requires an operator-supplied runtime image pinned by digest. [SKILL.md](SKILL.md) describes the commands; `make integration` runs a real transient unit against a scratch repository.
+`scripts/runnerctl` registers, runs, verifies, and removes one runner per registration in a Docker container on Linux, under the systemd user unit template in `systemd/user/`. It reaches GitHub only through the helper, feeds the helper's token file to a short-lived configuration container on its standard input and answers `config.sh`'s prompt from it under a pseudo-terminal with echo off, supervises the listener as a notify service, and stops it through a bounded stop path of 75 seconds at most, phase by phase, under the unit's `TimeoutStopSec=90`. It requires an operator-supplied runtime image pinned by digest. [SKILL.md](SKILL.md) describes the commands; `make integration` runs a real transient unit only after `RUNNERCTL_INTEGRATION_REPO` and `RUNNER_IMAGE` are set for a scratch repository and image.
 
 ## Development
 

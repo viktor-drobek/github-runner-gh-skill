@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## 1.0.1 — 2026-10-08
+
+### Fixed
+
+- Passed the explicit repository and documented labels to `runnerctl register` examples.
+- Passed the exact registration slug to the persistent `runnerctl remove` example.
+- Required `RUNNER_IMAGE` and passed it to the opt-in integration test.
+- Added documentation contract coverage for the required manager arguments.
+
 ## 1.0.0 — 2026-10-08
 
 ### Public release

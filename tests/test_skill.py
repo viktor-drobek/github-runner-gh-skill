@@ -198,6 +198,22 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("`conclusion` column", text)
         self.assertIn("RUN_ID", text)
 
+    def test_runnerctl_examples_pass_required_arguments(self) -> None:
+        skill = SKILL.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        for document in (skill, readme):
+            with self.subTest(document=document[:20]):
+                self.assertIn('register --repo "$repo" --token-file {} --image "$RUNNER_IMAGE"', document)
+                self.assertIn('--labels "$labels"', document)
+        self.assertIn('labels=repository-build', skill)
+        self.assertIn('remove "$slug" --token-file {}', skill)
+
+    def test_integration_requires_a_repository_and_image(self) -> None:
+        integration = (ROOT / "tests" / "integration" / "test_runnerctl_integration.py").read_text(encoding="utf-8")
+        self.assertIn('RUNNER_IMAGE = os.environ.get("RUNNER_IMAGE", "")', integration)
+        self.assertIn('@unittest.skipUnless(REPO and RUNNER_IMAGE', integration)
+        self.assertIn('"--image", RUNNER_IMAGE', integration)
+
     def test_tests_run_by_module_path_from_repository_root(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "unittest", "tests.test_skill.DocumentationContractTest.test_script_uses_gh_for_github_access"],
