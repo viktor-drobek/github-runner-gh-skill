@@ -1,0 +1,35 @@
+# systemd user unit template for one runnerctl registration; the instance name is the registration's SLUG.
+#
+# Install for the account that runs the runners (it needs Docker access and lingering):
+#   loginctl enable-linger runner
+#   install -D -m 0644 systemd/user/runnerctl@.service ~/.config/systemd/user/runnerctl@.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now runnerctl@SLUG.service
+#
+# runnerctl run is the main process: it notifies READY=1 once the listener reports "Listening for Jobs",
+# answers TERM at once, and runs the bounded stop path (75 s at most) before it exits, which is why no
+# ExecStop is needed and TimeoutStopSec leaves 15 s of room. Every stop of the unit, a reboot included,
+# runs that path: a persistent runner is deregistered on stop and registered again by the operator before
+# the unit is started again; the unit does not loop on a missing registration. KillMode=mixed sends TERM to the main
+# process only and KILL to the rest of the control group when the timeout expires.
+[Unit]
+Description=GitHub Actions runner %i (runnerctl)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/github-runner-gh-skill/scripts/runnerctl run %i
+Environment=RUNNERCTL_STATE_DIR=%S/runnerctl
+StateDirectory=runnerctl
+KillMode=mixed
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+# 3: an ephemeral registration ended without assignment evidence; 4: no registration to run. Neither is
+# cured by a restart, so the unit stays failed until the operator acts.
+RestartPreventExitStatus=3 4
+
+[Install]
+WantedBy=default.target

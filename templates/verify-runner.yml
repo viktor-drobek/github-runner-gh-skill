@@ -1,0 +1,33 @@
+# Verification workflow template for github-runner-gh-skill.
+#
+# Copy this file to .github/workflows/verify-runner.yml in the repository whose runner is being verified.
+# Adding it is a repository content change that the operator approves. The helper's dispatch-run command
+# needs the marker input and a run-name that ends with it; the runner_label input has no default, so this
+# workflow can only select the runner the operator names, never an unrelated one.
+#
+# The job's step succeeds when the runner can run anything at all. wait-assignment accepts a completed job
+# on the exact runner ID and name regardless of its conclusion, so even a failed step proves assignment.
+name: verify-runner
+run-name: verify ${{ inputs.marker }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      marker:
+        description: Marker that identifies this dispatch; passed by dispatch-run, one word per dispatch
+        required: true
+        type: string
+      runner_label:
+        description: Custom label of the runner under verification (never self-hosted alone)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 5
+    steps:
+      - name: Report the runner
+        run: echo "verification job ${{ inputs.marker }} on $RUNNER_NAME"

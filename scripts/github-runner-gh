@@ -1,0 +1,1046 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep glob ranges ASCII where Bash supports it; security-sensitive numeric input uses an explicit set below.
+shopt -s globasciiranges
+
+# GitHub IDs are 64-bit integers; nothing larger can name a runner or a run.
+readonly MAX_ID=9223372036854775807
+readonly MAX_TIMEOUT_SECONDS=86400
+readonly DEFAULT_TIMEOUT_SECONDS=120
+readonly POLL_INTERVAL_SECONDS=5
+readonly RATE_LIMIT_PAUSE_SECONDS=60
+readonly DELETE_CONFIRM_ATTEMPTS=3
+readonly DELETE_CONFIRM_INTERVAL_SECONDS=2
+readonly DISPATCH_TIMEOUT_SECONDS=60
+readonly DISPATCH_POLL_INTERVAL_SECONDS=2
+readonly COMMIT_RUN_TIMEOUT_SECONDS=60
+readonly COMMIT_RUN_POLL_INTERVAL_SECONDS=2
+readonly DEFAULT_STOP_GRACE_SECONDS=5
+readonly MAX_STOP_GRACE_SECONDS=600
+
+readonly EPHEMERAL_JQ='(if .ephemeral == null then "unknown" else (.ephemeral | tostring) end)'
+readonly RUNNER_TSV="[.id, .name, .os, .status, (.busy | tostring), ${EPHEMERAL_JQ}, ([.labels[].name] | join(\",\"))] | @tsv"
+readonly RUNNER_CHECK_TSV="[${EPHEMERAL_JQ}, ([.labels[] | select(.type == \"custom\" and (.name | ascii_downcase) == \"self-hosted\")] | length), .name] | @tsv"
+# Runner IDs are compared as text so jq versions that store numbers as doubles cannot match a neighbouring ID.
+readonly JOB_MATCH_JQ='map(.jobs[]) | map(select((.runner_id | tostring) == $runner_id and .runner_name == $runner and (.status == "in_progress" or .status == "completed"))) | first // empty | [.run_id, .id, .name, .status, .runner_id, .runner_name, (.conclusion // "")] | map(tostring) | @tsv'
+readonly COMPLETED_JOB_JQ='map(.jobs[]) | map(select((.runner_id | tostring) == $runner_id and .runner_name == $runner and .status == "completed")) | first // empty | [.id, (.conclusion // "")] | map(tostring) | @tsv'
+readonly RUN_FINISHED_JQ='map(.jobs[]) | length > 0 and all(.status == "completed")'
+
+# Statuses returned by request helpers and polls.
+readonly STATUS_ABSENT=1
+readonly STATUS_RETRY=2
+readonly STATUS_UNAUTHORIZED=3
+readonly STATUS_RATE_LIMITED=4
+readonly STATUS_PENDING=5
+readonly STATUS_FINISHED=6
+
+usage() {
+  cat <<EOF
+Usage:
+  github-runner-gh [--repo OWNER/REPOSITORY] auth
+  github-runner-gh [--repo OWNER/REPOSITORY] permission
+  github-runner-gh [--repo OWNER/REPOSITORY] list
+  github-runner-gh [--repo OWNER/REPOSITORY] get RUNNER_ID
+  github-runner-gh [--repo OWNER/REPOSITORY] check RUNNER_ID MODE [RUN_ID EXACT_RUNNER_NAME]
+  github-runner-gh [--repo OWNER/REPOSITORY] registration-token-file
+  github-runner-gh [--repo OWNER/REPOSITORY] remove-token-file
+  github-runner-gh [--repo OWNER/REPOSITORY] with-registration-token COMMAND [ARGS...]
+  github-runner-gh [--repo OWNER/REPOSITORY] with-remove-token COMMAND [ARGS...]
+  github-runner-gh [--repo OWNER/REPOSITORY] runs
+  github-runner-gh [--repo OWNER/REPOSITORY] jobs RUN_ID
+  github-runner-gh [--repo OWNER/REPOSITORY] dispatch-run WORKFLOW REF marker=MARKER [KEY=VALUE...]
+  github-runner-gh [--repo OWNER/REPOSITORY] run-for-commit WORKFLOW HEAD_SHA [EVENT]
+  github-runner-gh [--repo OWNER/REPOSITORY] wait-assignment RUNNER_ID EXACT_RUNNER_NAME RUN_ID [TIMEOUT_SECONDS]
+  github-runner-gh [--repo OWNER/REPOSITORY] delete RUNNER_ID EXACT_RUNNER_NAME
+
+Every command except auth needs OWNER/REPOSITORY from --repo or GH_REPO.
+MODE is the runner mode the operator declared: ephemeral or persistent. With RUN_ID and the exact name captured
+before that run's job, check also records whether the registration's state after the job is consistent with MODE.
+with-* commands run COMMAND with the token file path in GITHUB_RUNNER_TOKEN_FILE and in place of {} arguments;
+on HUP, INT, or TERM they stop COMMAND with TERM and then KILL after GITHUB_RUNNER_GH_STOP_GRACE_SECONDS (default 5).
+dispatch-run triggers WORKFLOW on REF with the inputs and prints the ID of the one new run whose title
+ends with MARKER as its last word, so WORKFLOW needs a run-name that ends with the marker input.
+run-for-commit prints the ID of the one run of WORKFLOW for the 40-character commit HEAD_SHA, optionally of EVENT
+(push, workflow_dispatch, pull_request, or schedule), and fails when the commit has several runs.
+TIMEOUT_SECONDS defaults to ${DEFAULT_TIMEOUT_SECONDS} and must not exceed ${MAX_TIMEOUT_SECONDS}.
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage_error() {
+  usage >&2
+  exit 2
+}
+
+# Invocation errors, whether an argument count or a value is wrong, share exit status 2.
+argument_error() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"
+}
+
+require_arg_count() {
+  local expected="$1"
+  shift
+  [[ $# -eq "$expected" ]] || usage_error
+}
+
+validate_repository() {
+  local owner="${1%%/*}"
+  local name="${1#*/}"
+
+  [[ "$1" == */* && "$1" != */*/* && -n "$owner" && -n "$name" \
+    && "$owner" != *[!A-Za-z0-9_.-]* && "$name" != *[!A-Za-z0-9_.-]* ]] \
+    || argument_error 'repository must use OWNER/REPOSITORY form'
+}
+
+# Prints the value without leading zeros; compares digit strings because shell arithmetic wraps past 64 bits.
+positive_integer() {
+  local value="$1"
+  local label="$2"
+  local max="$3"
+
+  [[ -n "$value" && "$value" != *[!0123456789]* ]] || argument_error "$label must be a positive integer"
+  value="${value#"${value%%[!0]*}"}"
+  [[ -n "$value" ]] || argument_error "$label must be greater than zero"
+  if (( ${#value} > ${#max} )) || [[ ${#value} -eq ${#max} && "$value" > "$max" ]]; then
+    argument_error "$label must not exceed $max"
+  fi
+  printf '%s\n' "$value"
+}
+
+validate_workflow() {
+  [[ -n "$1" && "$1" != *[!A-Za-z0-9_.-]* ]] \
+    || argument_error "workflow must be a workflow file name or numeric ID, not '$1'"
+  printf '%s\n' "$1"
+}
+
+validate_head_sha() {
+  local LC_ALL=C
+
+  [[ ${#1} -eq 40 && "$1" != *[!0-9A-Fa-f]* ]] \
+    || argument_error "HEAD_SHA must be the full 40-character hexadecimal commit SHA, not '$1'"
+  printf '%s\n' "$1"
+}
+
+validate_event() {
+  case "$1" in
+    push|workflow_dispatch|pull_request|schedule) printf '%s\n' "$1" ;;
+    *) argument_error "event must be push, workflow_dispatch, pull_request, or schedule, not '$1'" ;;
+  esac
+}
+
+validate_ref() {
+  [[ -n "$1" && "$1" != *[[:space:]]* && "$1" != -* ]] \
+    || argument_error "ref must be a branch or tag name without spaces, not '$1'"
+  printf '%s\n' "$1"
+}
+
+validate_input() {
+  local key="${1%%=*}"
+  [[ "$1" == *=* && -n "$key" && "$key" != *[!A-Za-z0-9_-]* ]] \
+    || argument_error "workflow inputs must be KEY=VALUE, not '$1'"
+  # The marker is the last word of a run title, so it is kept to characters no whitespace rule can split.
+  [[ "$key" != 'marker' || ( -n "${1#*=}" && "${1#*=}" != *[!A-Za-z0-9._-]* ) ]] \
+    || argument_error 'the marker input must be one word of ASCII letters, digits, ".", "_", and "-"'
+}
+
+# Requires exactly one marker input among KEY=VALUE arguments, since only the marker ties a run to the dispatch.
+require_marker_input() {
+  local input markers=0
+
+  for input in "$@"; do
+    [[ "${input%%=*}" != 'marker' ]] || markers=$(( markers + 1 ))
+  done
+  (( markers != 0 )) || argument_error "dispatch-run needs a marker input (marker=VALUE) that the workflow's run-name includes"
+  (( markers == 1 )) || argument_error 'dispatch-run takes one marker input'
+}
+
+# Prints the grace period between TERM and KILL when the helper stops a command or request: the environment
+# overrides the default so a manager's removal step can be given the time it needs.
+stop_grace_seconds() {
+  local value="${GITHUB_RUNNER_GH_STOP_GRACE_SECONDS-$DEFAULT_STOP_GRACE_SECONDS}"
+
+  positive_integer "$value" 'GITHUB_RUNNER_GH_STOP_GRACE_SECONDS' "$MAX_STOP_GRACE_SECONDS"
+}
+
+# Prints the declared runner mode, which the operator must state; it is never inferred.
+validate_mode() {
+  case "$1" in
+    ephemeral|persistent) printf '%s\n' "$1" ;;
+    *) argument_error "runner mode must be ephemeral or persistent, not '$1'" ;;
+  esac
+}
+
+require_explicit_repository() {
+  local repository="$1"
+  local source="$2"
+
+  [[ -n "$source" ]] \
+    || argument_error 'pass --repo OWNER/REPOSITORY or set GH_REPO; the helper does not guess the target repository'
+  [[ -n "$repository" ]] || argument_error "$source must not be empty; pass OWNER/REPOSITORY explicitly"
+  validate_repository "$repository"
+}
+
+require_admin() {
+  local repository="$1"
+  local permission
+
+  gh auth status >/dev/null
+  permission="$(gh repo view "$repository" --json viewerPermission --jq '.viewerPermission')"
+  [[ "$permission" == 'ADMIN' ]] \
+    || die "repository admin permission is required for $repository; current permission: $permission"
+}
+
+# Settings that would put diagnostics, telemetry, update notices, or colour into output the helper parses or stores.
+readonly QUIET_GH_ENV=(GH_DEBUG= DEBUG= GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 GH_FORCE_TTY= CLICOLOR_FORCE=)
+
+# Runs gh with those settings disabled. Background requests spell out `env "${QUIET_GH_ENV[@]}" gh` instead,
+# so that $! is the gh process itself and a trap can stop it.
+quiet_gh() {
+  env "${QUIET_GH_ENV[@]}" gh "$@"
+}
+
+# Traps HUP, INT, and TERM so HANDLER runs with the signal's exit code as its argument.
+trap_interrupts() {
+  trap "$1 129" HUP
+  trap "$1 130" INT
+  trap "$1 143" TERM
+}
+
+untrap_interrupts() {
+  trap - HUP INT TERM
+}
+
+# Stops the process recorded in pending_request_pid, if one is running: TERM first, then KILL after a grace
+# period, so a process that ignores TERM cannot block cleanup. When pending_request_group_fd is set, it
+# reads the process group that the manager supervisor reports there and signals that whole group instead,
+# so a manager's children cannot outlive it.
+stop_pending_request() {
+  local pid="${pending_request_pid:-}" group_fd="${pending_request_group_fd:-}" group='' target killer waited=0
+
+  [[ -n "$pid" ]] || return 0
+  pending_request_pid=''
+  pending_request_group_fd=''
+  target="$pid"
+  if [[ -n "$group_fd" ]]; then
+    # The manager reports its group before it starts, and the supervisor right after starting it.
+    read -r -t "$STOP_GRACE_SECONDS" -u "$group_fd" group 2>/dev/null || group=''
+    [[ "$group" != *[!0-9]* && -n "$group" ]] || group=''
+    [[ -z "$group" ]] || target="-$group"
+  fi
+  kill -TERM -- "$target" 2>/dev/null || :
+  # After the grace period, KILL the target and, when the target is a group, the supervisor waited on below:
+  # a stopped supervisor would otherwise keep the wait from returning.
+  (
+    sleep "$STOP_GRACE_SECONDS"
+    kill -KILL -- "$target" 2>/dev/null
+    [[ "$target" == "$pid" ]] || kill -KILL "$pid" 2>/dev/null
+  ) 2>/dev/null &
+  killer=$!
+  wait "$pid" 2>/dev/null || :
+  kill "$killer" 2>/dev/null || :
+  wait "$killer" 2>/dev/null || :
+  [[ -n "$group" ]] || return 0
+  # The supervisor is reaped, but the manager's children may still be running in the group.
+  while kill -0 -- "$target" 2>/dev/null && (( waited < STOP_GRACE_SECONDS )); do
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  kill -KILL -- "$target" 2>/dev/null || :
+}
+
+# Builds repos/OWNER/REPOSITORY/actions/runners/NAME for a runner ID or a token endpoint name.
+runner_endpoint() {
+  printf 'repos/%s/actions/runners/%s\n' "$1" "$2"
+}
+
+runners_endpoint() {
+  printf 'repos/%s/actions/runners?per_page=100\n' "$1"
+}
+
+in_progress_runs_endpoint() {
+  printf 'repos/%s/actions/runs?status=in_progress&exclude_pull_requests=true&per_page=100\n' "$1"
+}
+
+run_jobs_endpoint() {
+  printf 'repos/%s/actions/runs/%s/jobs?per_page=100\n' "$1" "$2"
+}
+
+# Requests a token into a private temporary file recorded in token_file. Until the caller clears the traps,
+# this process removes the file and stops the request on exit or on HUP, INT, or TERM.
+create_token_file() {
+  local repository="$1"
+  local label="$2"
+  local previous_umask
+
+  # Script-scoped state survives function unwinding on an errexit failure.
+  token_file=''
+  pending_request_pid=''
+  handoff_dir=''
+  trap 'stop_pending_request; [[ -z "$token_file" ]] || rm -f -- "$token_file"; [[ -z "$handoff_dir" ]] || rm -rf -- "$handoff_dir"' EXIT
+  trap_interrupts exit
+
+  previous_umask="$(umask)"
+  umask 077
+  token_file="$(mktemp "${TMPDIR:-/tmp}/github-runner-${label}.XXXXXX")"
+  umask "$previous_umask"
+  # HTTP diagnostics include response bodies, even with --jq and redirection.
+  # Run asynchronously so a signal interrupts wait and triggers cleanup promptly.
+  env "${QUIET_GH_ENV[@]}" gh api --method POST "$(runner_endpoint "$repository" "$label")" \
+    --jq '.token | select(type == "string" and . != "")' >"$token_file" &
+  pending_request_pid=$!
+  if ! wait "$pending_request_pid"; then
+    pending_request_pid=''
+    die "failed to request the ${label%-token} token"
+  fi
+  pending_request_pid=''
+  chmod 0600 "$token_file"
+  [[ -s "$token_file" ]] || die "GitHub returned no ${label%-token} token"
+}
+
+release_token_traps() {
+  trap - EXIT
+  untrap_interrupts
+}
+
+print_token_file() {
+  create_token_file "$1" "$2"
+  printf '%s\n' "$token_file"
+  release_token_traps
+}
+
+# Runs COMMAND with the token file path in GITHUB_RUNNER_TOKEN_FILE and in place of {} arguments,
+# removes the file, and returns the command's status.
+run_with_token_file() {
+  local repository="$1"
+  local label="$2"
+  shift 2
+  local argument status=0 group_fd manager_err
+  local arguments=()
+
+  create_token_file "$repository" "$label"
+  # The replacement is quoted so that patsub_replacement cannot interpret & in the path.
+  for argument in "$@"; do
+    arguments+=("${argument//\{\}/"$token_file"}")
+  done
+  # A supervisor subshell starts the manager under job control, which gives it its own process group so
+  # its children are stopped with it, reports that group through a pipe, and brings the manager to the
+  # foreground with fg, which hands it the terminal when there is one: a background job in its own group
+  # would be stopped by SIGTTIN as soon as it read from the terminal. This process waits on the supervisor,
+  # so a signal reaches the trap at once instead of after the manager exits, and the trap stops the whole
+  # group before the file is removed. The explicit redirection keeps standard input connected, which
+  # background jobs lose while job control is off. On a terminal, the interrupt keys reach the manager's
+  # group rather than this process, so a manager that ignores them keeps the file until it exits.
+  handoff_dir="$(mktemp -d "${TMPDIR:-/tmp}/github-runner-handoff.XXXXXX")"
+  mkfifo -m 0600 "$handoff_dir/group"
+  exec {group_fd}<>"$handoff_dir/group"
+  rm -rf -- "$handoff_dir"
+  handoff_dir=''
+  (
+    # Job control looks for the terminal on standard error; when only standard input is one, use that.
+    # The manager keeps the original standard error, and fg's own output, the job's command line and a
+    # notice when a signal ends it, goes to the terminal or nowhere.
+    exec {manager_err}>&2
+    [[ -t 2 || ! -t 0 ]] || exec 2<&0
+    set -m
+    manager() {
+      # This process is the group leader; report the group itself, so cleanup does not depend on the
+      # supervisor getting to its own report before it is stopped or ended. Both reports name the same group.
+      printf '%s\n' "$BASHPID" >&"$group_fd"
+      exec {group_fd}>&- 2>&"$manager_err" {manager_err}>&-
+      export GITHUB_RUNNER_TOKEN_FILE="$token_file"
+      exec "${arguments[@]}"
+    }
+    manager &
+    printf '%s\n' "$!" >&"$group_fd"
+    if [[ -t 2 ]]; then
+      fg %1 >/dev/null
+    else
+      fg %1 >/dev/null 2>&1
+    fi
+  ) 0<&0 &
+  pending_request_pid=$!
+  pending_request_group_fd="$group_fd"
+  wait "$pending_request_pid" || status=$?
+  pending_request_pid=''
+  pending_request_group_fd=''
+  exec {group_fd}>&-
+  rm -f -- "$token_file"
+  token_file=''
+  release_token_traps
+  return "$status"
+}
+
+workflow_runs_endpoint() {
+  printf 'repos/%s/actions/workflows/%s/runs?event=workflow_dispatch&exclude_pull_requests=true&per_page=100\n' "$1" "$2"
+}
+
+commit_runs_endpoint() {
+  printf 'repos/%s/actions/workflows/%s/runs?head_sha=%s%s&per_page=100\n' "$1" "$2" "$3" "${4:+&event=$4}"
+}
+
+workflow_dispatches_endpoint() {
+  printf 'repos/%s/actions/workflows/%s/dispatches\n' "$1" "$2"
+}
+
+# Prints a one-line description built from GitHub CLI's error lines and returns the status they imply:
+# STATUS_ABSENT (404), STATUS_UNAUTHORIZED (401), STATUS_RATE_LIMITED (403 or 429 for a rate limit), or
+# STATUS_RETRY. Only standard error is read, so response bodies can never influence the classification.
+classify_gh_error() {
+  local error="$1"
+  local code=''
+  local message_error='\(HTTP ([0-9]{3})\)'
+  local bare_error=$'(^|\n)gh: HTTP ([0-9]{3})($|\n)'
+
+  # gh prints "gh: <message> (HTTP nnn)" for JSON error bodies and "gh: HTTP nnn" for other bodies.
+  if [[ "$error" =~ $message_error ]]; then
+    code="${BASH_REMATCH[1]}"
+  elif [[ "$error" =~ $bare_error ]]; then
+    code="${BASH_REMATCH[2]}"
+  fi
+  [[ -n "$error" ]] || error='gh failed without an error message'
+  printf '%s\n' "${error//$'\n'/; }"
+  case "$code" in
+    404) return "$STATUS_ABSENT" ;;
+    401) return "$STATUS_UNAUTHORIZED" ;;
+    403|429) [[ "${error,,}" == *'rate limit'* ]] && return "$STATUS_RATE_LIMITED" ;;
+  esac
+  return "$STATUS_RETRY"
+}
+
+# Runs a gh api request. Prints the response body and returns 0, or prints classify_gh_error's
+# description and returns its status.
+gh_request() {
+  local stderr_file output error
+
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/github-runner-gh-stderr.XXXXXX")"
+  if output="$(quiet_gh api "$@" 2>"$stderr_file")"; then
+    rm -f -- "$stderr_file"
+    printf '%s\n' "$output"
+    return 0
+  fi
+  error="$(<"$stderr_file")"
+  rm -f -- "$stderr_file"
+  classify_gh_error "$error"
+}
+
+# Applies a jq program to a response body read as a stream of pages. Prints the result, or prints a
+# description and returns STATUS_RETRY when the body is empty or not JSON.
+# Usage: project_json BODY WHAT [JQ_OPTIONS...] PROGRAM
+project_json() {
+  local body="$1"
+  local what="$2"
+  shift 2
+  local result
+
+  if [[ -z "${body//[[:space:]]/}" ]]; then
+    printf '%s was empty\n' "$what"
+    return "$STATUS_RETRY"
+  fi
+  if ! result="$(jq -rs "$@" <<<"$body" 2>&1)"; then
+    printf '%s could not be parsed: %s\n' "$what" "${result//$'\n'/; }"
+    return "$STATUS_RETRY"
+  fi
+  printf '%s\n' "$result"
+}
+
+# Prints a jq projection of one runner, or a description of the failure with gh_request's status.
+# A single GET is exact, unlike a paged list that shifts while runners register and deregister.
+lookup_runner() {
+  local repository="$1"
+  local runner_id="$2"
+  local program="$3"
+  local body status=0
+
+  body="$(gh_request "$(runner_endpoint "$repository" "$runner_id")")" || status=$?
+  if (( status != 0 )); then
+    printf '%s\n' "$body"
+    return "$status"
+  fi
+  project_json "$body" 'the runner response' ".[0] | ${program}"
+}
+
+runner_not_found() {
+  printf 'GitHub answers 404 for runner %s in %s: no repository-level runner has that ID\n' "$1" "$2"
+}
+
+# Dies with a uniform message when lookup_runner failed.
+require_lookup() {
+  local status="$1"
+  local output="$2"
+  local runner_id="$3"
+  local repository="$4"
+
+  case "$status" in
+    0) ;;
+    "$STATUS_ABSENT") die "$(runner_not_found "$runner_id" "$repository")" ;;
+    *) die "could not read runner $runner_id from $repository: $output" ;;
+  esac
+}
+
+list_runners() {
+  local repository="$1"
+  printf 'id\tname\tos\tstatus\tbusy\tephemeral\tlabels\n'
+  quiet_gh api --paginate "$(runners_endpoint "$repository")" --jq ".runners[] | ${RUNNER_TSV}"
+}
+
+get_runner() {
+  local repository="$1"
+  local runner_id="$2"
+  local output status=0
+
+  output="$(lookup_runner "$repository" "$runner_id" "$RUNNER_TSV")" || status=$?
+  require_lookup "$status" "$output" "$runner_id" "$repository"
+  printf '%s\n' "$output"
+}
+
+# Prints the runner record, then fails unless GitHub reports the declared mode and no custom self-hosted label.
+# Prints "JOB_ID<TAB>CONCLUSION" for the first completed job of the run on the exact runner ID and name.
+completed_job_on_runner() {
+  local repository="$1"
+  local runner_id="$2"
+  local runner_name="$3"
+  local run_id="$4"
+  local body match status=0
+
+  body="$(gh_request --paginate "$(run_jobs_endpoint "$repository" "$run_id")")" || status=$?
+  case "$status" in
+    0) ;;
+    "$STATUS_ABSENT") die "GitHub answers 404 for run $run_id in $repository: $body" ;;
+    *) die "could not read the jobs of run $run_id in $repository: $body" ;;
+  esac
+  match="$(project_json "$body" "the job listing of run $run_id" \
+    --arg runner_id "$runner_id" --arg runner "$runner_name" "$COMPLETED_JOB_JQ")" \
+    || die "could not read the jobs of run $run_id in $repository: $match"
+  [[ -n "$match" ]] \
+    || die "run $run_id has no completed job on runner $runner_id ('$runner_name'); the observation needs a job that ran on that exact runner ID and name"
+  printf '%s\n' "$match"
+}
+
+# Prints the runner and fails unless GitHub's record fits the declared mode: the ephemeral field, when
+# reported, must match it, and no custom self-hosted label may exist. With a run ID and the exact name
+# captured before that run's job, the registration's state after a completed job on that runner is recorded
+# as an observation: consistent with the mode, or a contradiction. It is never a proof of the mode, which
+# rests on the registration flags the operator passed.
+check_runner() {
+  local repository="$1"
+  local runner_id="$2"
+  local mode="$3"
+  local run_id="${4:-}"
+  local expected_name="${5:-}"
+  local body row verdict name ephemeral reserved_custom_labels expected status=0 registered=true
+  local job job_id conclusion evidence
+
+  body="$(gh_request "$(runner_endpoint "$repository" "$runner_id")")" || status=$?
+  if (( status == STATUS_ABSENT )) && [[ -n "$run_id" ]]; then
+    registered=false
+    name="$expected_name"
+    ephemeral=unknown
+  else
+    require_lookup "$status" "$body" "$runner_id" "$repository"
+    row="$(project_json "$body" 'the runner response' ".[0] | ${RUNNER_TSV}")" \
+      || die "could not read runner $runner_id from $repository: $row"
+    verdict="$(project_json "$body" 'the runner response' ".[0] | ${RUNNER_CHECK_TSV}")" \
+      || die "could not read runner $runner_id from $repository: $verdict"
+    # The name comes last because a leading empty field would be dropped by read.
+    IFS=$'\t' read -r ephemeral reserved_custom_labels name <<<"$verdict"
+    printf '%s\n' "$row"
+    [[ -z "$run_id" || "$name" == "$expected_name" ]] \
+      || die "runner $runner_id is now named '$name', not '$expected_name': not the registration the job ran on"
+  fi
+
+  expected=false
+  [[ "$mode" != 'ephemeral' ]] || expected=true
+  if [[ -z "$run_id" ]]; then
+    [[ "$ephemeral" != 'unknown' ]] \
+      || die "runner $runner_id ($name) is declared $mode, but GitHub does not report its ephemeral state; rerun with the run ID and exact name once the verification job completed to record the observation"
+    [[ "$ephemeral" == "$expected" ]] \
+      || die "runner $runner_id ($name) is declared $mode, but GitHub reports ephemeral=$ephemeral"
+    [[ "$reserved_custom_labels" == '0' ]] \
+      || die "runner $runner_id ($name) has the reserved label 'self-hosted' as a custom label"
+    printf 'Runner %s (%s) is %s and has no custom self-hosted label\n' "$runner_id" "$name" "$mode"
+    return 0
+  fi
+
+  job="$(completed_job_on_runner "$repository" "$runner_id" "$expected_name" "$run_id")"
+  IFS=$'\t' read -r job_id conclusion <<<"$job"
+  evidence="completed job $job_id of run $run_id"
+  if [[ "$registered" == false ]]; then
+    [[ "$mode" == 'ephemeral' ]] \
+      || die "runner $runner_id ($expected_name) is declared persistent, but GitHub answers 404 after $evidence"
+    printf 'observation: runner %s (%s) gone after %s; consistent with ephemeral, not a proof of mode\n' \
+      "$runner_id" "$expected_name" "$evidence"
+    return 0
+  fi
+  # A reported field is authoritative; the observation never overrides it.
+  [[ "$ephemeral" == 'unknown' || "$ephemeral" == "$expected" ]] \
+    || die "runner $runner_id ($name) is declared $mode, but GitHub reports ephemeral=$ephemeral"
+  [[ "$mode" == 'persistent' ]] \
+    || die "runner $runner_id ($name) is declared ephemeral, but it is still registered after $evidence"
+  [[ "$reserved_custom_labels" == '0' ]] \
+    || die "runner $runner_id ($name) has the reserved label 'self-hosted' as a custom label"
+  printf 'observation: runner %s (%s) still registered after %s; consistent with persistent, not a proof of mode\n' \
+    "$runner_id" "$name" "$evidence"
+  if [[ "$ephemeral" == 'unknown' ]]; then
+    printf 'Runner %s (%s) has no custom self-hosted label; GitHub does not report its ephemeral state\n' "$runner_id" "$name"
+  else
+    printf 'Runner %s (%s) is %s and has no custom self-hosted label\n' "$runner_id" "$name" "$mode"
+  fi
+}
+
+list_runs() {
+  local repository="$1"
+  printf 'run_id\tworkflow\tstatus\thead_sha\turl\n'
+  quiet_gh api --paginate "$(in_progress_runs_endpoint "$repository")" --jq \
+    '.workflow_runs[] | [.id, .name, .status, .head_sha, .html_url] | @tsv'
+}
+
+list_jobs() {
+  local repository="$1"
+  local run_id="$2"
+  printf 'job_id\tname\tstatus\trunner_id\trunner_name\trunner_group\n'
+  quiet_gh api --paginate "$(run_jobs_endpoint "$repository" "$run_id")" --jq \
+    '.jobs[] | [.id, .name, .status, (.runner_id // ""), (.runner_name // ""), (.runner_group_name // "")] | @tsv'
+}
+
+# Inspects one run's jobs. Prints the matching job as TSV and returns 0, returns STATUS_PENDING while no
+# job on the runner is in progress or completed, STATUS_FINISHED when every job completed without one,
+# or prints a description and returns the request failure status.
+poll_run_jobs() {
+  local repository="$1"
+  local runner_id="$2"
+  local runner_name="$3"
+  local run_id="$4"
+  local body match finished status=0
+
+  body="$(gh_request --paginate "$(run_jobs_endpoint "$repository" "$run_id")")" || status=$?
+  if (( status != 0 )); then
+    printf '%s\n' "$body"
+    return "$status"
+  fi
+  match="$(project_json "$body" "the job listing of run $run_id" \
+    --arg runner_id "$runner_id" --arg runner "$runner_name" "$JOB_MATCH_JQ")" \
+    || { printf '%s\n' "$match"; return "$STATUS_RETRY"; }
+  if [[ -n "$match" ]]; then
+    printf '%s\n' "$match"
+    return 0
+  fi
+  finished="$(project_json "$body" "the job listing of run $run_id" "$RUN_FINISHED_JQ")" \
+    || { printf '%s\n' "$finished"; return "$STATUS_RETRY"; }
+  [[ "$finished" != 'true' ]] || return "$STATUS_FINISHED"
+  return "$STATUS_PENDING"
+}
+
+# Seconds to pause after a rate-limit response: GitHub's reset time for the primary limit, or a fixed
+# pause for a secondary limit and when the reset time cannot be read.
+rate_limit_pause() {
+  local description="$1"
+  local body reset now
+
+  if [[ "${description,,}" != *secondary* ]] \
+    && body="$(gh_request rate_limit)" \
+    && reset="$(project_json "$body" 'the rate limit response' '.[0].resources.core.reset')" \
+    && [[ "$reset" =~ ^[0-9]{1,18}$ ]]; then
+    now="$(date +%s)"
+    if (( reset > now )); then
+      printf '%s\n' "$(( reset - now ))"
+      return
+    fi
+  fi
+  printf '%s\n' "$RATE_LIMIT_PAUSE_SECONDS"
+}
+
+wait_for_assignment() {
+  local repository="$1"
+  local runner_id="$2"
+  local runner_name="$3"
+  local run_id="$4"
+  local timeout_seconds="$5"
+  local deadline now remaining output status pause completed_polls=0 last_failure=''
+  local target="job of run $run_id on runner $runner_id ('$runner_name')"
+
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while :; do
+    status=0
+    output="$(poll_run_jobs "$repository" "$runner_id" "$runner_name" "$run_id")" || status=$?
+    pause="$POLL_INTERVAL_SECONDS"
+    case "$status" in
+      0)
+        printf 'run_id\tjob_id\tjob_name\tstatus\trunner_id\trunner_name\tconclusion\n'
+        printf '%s\n' "$output"
+        return 0
+        ;;
+      "$STATUS_PENDING")
+        completed_polls=$(( completed_polls + 1 ))
+        last_failure=''
+        ;;
+      "$STATUS_FINISHED") die "run $run_id finished without a job on runner $runner_id ('$runner_name')" ;;
+      "$STATUS_ABSENT") die "GitHub answers 404 for run $run_id in $repository: $output" ;;
+      "$STATUS_UNAUTHORIZED") die "$output" ;;
+      "$STATUS_RATE_LIMITED")
+        last_failure="$output"
+        pause="$(rate_limit_pause "$output")"
+        printf 'Warning: %s; pausing %ss for the rate limit\n' "$output" "$pause" >&2
+        ;;
+      *)
+        last_failure="$output"
+        printf 'Warning: %s; retrying\n' "$output" >&2
+        ;;
+    esac
+
+    now="$(date +%s)"
+    (( now < deadline )) || break
+    remaining=$(( deadline - now ))
+    sleep "$(( remaining < pause ? remaining : pause ))"
+  done
+
+  (( completed_polls > 0 )) \
+    || die "could not check for a $target within ${timeout_seconds}s; every poll failed, last failure: $last_failure"
+  [[ -z "$last_failure" ]] \
+    || die "no in_progress or completed $target within ${timeout_seconds}s; the last poll failed: $last_failure"
+  die "no in_progress or completed $target within ${timeout_seconds}s"
+}
+
+# Prints the newest workflow_dispatch runs of the workflow as "ID<TAB>MATCH" lines, where MATCH is true for
+# a run by the actor whose title is the marker or ends with a space and the marker, or a description with
+# the request status. The title is compared inside jq, so no escaping of the listing can alter it, and only
+# the last word counts, so neither a marker with the same prefix, such as abc-10 for abc-1, nor a fixed
+# word of every title, such as verify, can match.
+recent_dispatch_runs() {
+  local repository="$1"
+  local workflow="$2"
+  local actor="$3"
+  local marker="$4"
+  local body status=0
+
+  body="$(gh_request "$(workflow_runs_endpoint "$repository" "$workflow")")" || status=$?
+  if (( status != 0 )); then
+    printf '%s\n' "$body"
+    return "$status"
+  fi
+  project_json "$body" "the run listing of workflow $workflow" --arg actor "$actor" --arg marker "$marker" \
+    'map(.workflow_runs[] | [(.id | tostring),
+       (((.actor.login // "") == $actor
+         and (.display_title // .name // "" | . == $marker or endswith(" " + $marker))) | tostring)])
+     | .[] | @tsv'
+}
+
+# Prints the IDs of the matching runs in a listing that are new since the snapshot.
+new_dispatch_run_ids() {
+  local snapshot="$1"
+  local listing="$2"
+
+  jq -rn --arg snapshot "$snapshot" --arg listing "$listing" '
+    ($snapshot | split("\n") | map(select(. != "") | split("\t")[0])) as $seen
+    | $listing | split("\n") | map(select(. != "") | split("\t"))
+    | map(select(.[1] == "true" and (.[0] as $id | ($seen | index($id) | not))))
+    | .[][0]'
+}
+
+# Triggers the workflow and prints the ID of the run this dispatch created: the one run, new since the
+# listing taken before the dispatch, that the authenticated user dispatched and whose title carries the
+# marker input as its last word. Nothing else in a listing ties a run to a dispatch, so the marker is
+# required, and a listing with more than one new run carrying it is reported as ambiguous rather than
+# guessed; a reused marker whose runs surface in different listings cannot be told apart.
+dispatch_run() {
+  local repository="$1"
+  local workflow="$2"
+  local ref="$3"
+  shift 3
+  local input marker='' actor snapshot listing candidates output status=0
+  local deadline now remaining pause
+  local fields=(-f "ref=$ref")
+
+  for input in "$@"; do
+    fields+=(-f "inputs[${input%%=*}]=${input#*=}")
+    [[ "${input%%=*}" != 'marker' ]] || marker="${input#*=}"
+  done
+
+  output="$(gh_request user)" || die "could not read the authenticated user: $output"
+  actor="$(project_json "$output" 'the user response' '.[0].login')" || die "could not read the authenticated user: $actor"
+  [[ -n "$actor" && "$actor" != 'null' ]] || die 'could not read the authenticated user: GitHub returned no login'
+
+  snapshot="$(recent_dispatch_runs "$repository" "$workflow" "$actor" "$marker")" || status=$?
+  case "$status" in
+    0) ;;
+    "$STATUS_ABSENT") die "GitHub answers 404 for workflow $workflow in $repository: $snapshot" ;;
+    *) die "could not list the runs of workflow $workflow in $repository: $snapshot" ;;
+  esac
+
+  output="$(gh_request --method POST "$(workflow_dispatches_endpoint "$repository" "$workflow")" "${fields[@]}")" \
+    || die "could not dispatch workflow $workflow on $ref in $repository: $output"
+  printf 'Dispatched workflow %s on %s in %s; waiting for its run to appear\n' "$workflow" "$ref" "$repository" >&2
+
+  deadline=$(( $(date +%s) + DISPATCH_TIMEOUT_SECONDS ))
+  while :; do
+    status=0
+    pause="$DISPATCH_POLL_INTERVAL_SECONDS"
+    listing="$(recent_dispatch_runs "$repository" "$workflow" "$actor" "$marker")" || status=$?
+    case "$status" in
+      0)
+        candidates="$(new_dispatch_run_ids "$snapshot" "$listing" | sort -n)"
+        if [[ -n "$candidates" ]]; then
+          [[ "$candidates" != *$'\n'* ]] \
+            || die "more than one run of workflow $workflow carries marker $marker (${candidates//$'\n'/, }); dispatch again with a marker no other dispatch uses"
+          printf '%s\n' "$candidates"
+          return 0
+        fi
+        ;;
+      "$STATUS_UNAUTHORIZED") die "$listing" ;;
+      "$STATUS_RATE_LIMITED")
+        pause="$(rate_limit_pause "$listing")"
+        printf 'Warning: %s; pausing %ss for the rate limit\n' "$listing" "$pause" >&2
+        ;;
+      *) printf 'Warning: %s; retrying\n' "$listing" >&2 ;;
+    esac
+
+    now="$(date +%s)"
+    (( now < deadline )) || break
+    remaining=$(( deadline - now ))
+    sleep "$(( remaining < pause ? remaining : pause ))"
+  done
+
+  die "no new run of workflow $workflow with marker $marker appeared within ${DISPATCH_TIMEOUT_SECONDS}s of the dispatch"
+}
+
+# Prints the ID of the one run of the workflow for a commit. GitHub ties a run to its commit, so the run
+# identifies itself only when it is the only one for that commit and workflow (and event, when given);
+# several runs, from repeated triggers, are reported as ambiguous rather than guessed. Re-runs are attempts
+# of one run and do not multiply it. A run of a fresh push may take seconds to be created, so an empty
+# listing is polled for a while.
+run_for_commit() {
+  local repository="$1"
+  local workflow="$2"
+  local head_sha="$3"
+  local event="${4:-}"
+  local endpoint body ids status=0 deadline now remaining pause
+  local what="run of workflow $workflow for commit $head_sha${event:+ ($event)}"
+
+  endpoint="$(commit_runs_endpoint "$repository" "$workflow" "$head_sha" "$event")"
+  deadline=$(( $(date +%s) + COMMIT_RUN_TIMEOUT_SECONDS ))
+  while :; do
+    status=0
+    pause="$COMMIT_RUN_POLL_INTERVAL_SECONDS"
+    body="$(gh_request --paginate "$endpoint")" || status=$?
+    case "$status" in
+      0)
+        ids="$(project_json "$body" "the run listing of workflow $workflow" 'map(.workflow_runs[].id | tostring) | .[]' | sort -n)" \
+          || { printf 'Warning: %s; retrying\n' "$ids" >&2; ids=''; }
+        if [[ -n "$ids" ]]; then
+          [[ "$ids" != *$'\n'* ]] \
+            || die "commit $head_sha has more than one $what (${ids//$'\n'/, }); a run of a commit is identified only when it is the only one; for a dispatch, use dispatch-run with a marker"
+          printf '%s\n' "$ids"
+          return 0
+        fi
+        ;;
+      "$STATUS_ABSENT") die "GitHub answers 404 for workflow $workflow in $repository: $body" ;;
+      "$STATUS_UNAUTHORIZED") die "$body" ;;
+      "$STATUS_RATE_LIMITED")
+        pause="$(rate_limit_pause "$body")"
+        printf 'Warning: %s; pausing %ss for the rate limit\n' "$body" "$pause" >&2
+        ;;
+      *) printf 'Warning: %s; retrying\n' "$body" >&2 ;;
+    esac
+
+    now="$(date +%s)"
+    (( now < deadline )) || break
+    remaining=$(( deadline - now ))
+    sleep "$(( remaining < pause ? remaining : pause ))"
+  done
+
+  die "no $what was listed within ${COMMIT_RUN_TIMEOUT_SECONDS}s"
+}
+
+# Stops any in-flight request, reports the deletion's state, and exits with the signal's code.
+interrupt_deletion() {
+  stop_pending_request
+  rm -f -- "${delete_stderr_file:-}"
+  printf 'Error: %s\n' "$deletion_state" >&2
+  exit "$1"
+}
+
+delete_runner() {
+  local repository="$1"
+  local runner_id="$2"
+  local expected_name="$3"
+  local actual_name attempt status output reason
+
+  status=0
+  actual_name="$(lookup_runner "$repository" "$runner_id" '.name')" || status=$?
+  require_lookup "$status" "$actual_name" "$runner_id" "$repository"
+  [[ "$actual_name" == "$expected_name" ]] \
+    || die "runner name mismatch for ID $runner_id; expected '$expected_name', GitHub reports '$actual_name'"
+
+  # Script-scoped so the interrupt trap can describe the deletion whenever it fires.
+  deletion="the deletion of runner $runner_id ($actual_name) from $repository"
+  gone_hint="run 'get $runner_id': 'GitHub answers 404' means the runner is gone"
+  deletion_state="GitHub may have applied $deletion; the request was interrupted; $gone_hint, and if it still shows the runner, run delete again"
+  pending_request_pid=''
+  delete_stderr_file="$(mktemp "${TMPDIR:-/tmp}/github-runner-gh-stderr.XXXXXX")"
+  trap_interrupts interrupt_deletion
+
+  # The REST API has no conditional delete, but runner IDs are never reused and the API cannot rename a runner.
+  # Run asynchronously so a signal interrupts wait and the trap can stop the request.
+  env "${QUIET_GH_ENV[@]}" gh api --method DELETE "$(runner_endpoint "$repository" "$runner_id")" \
+    >/dev/null 2>"$delete_stderr_file" &
+  pending_request_pid=$!
+  if ! wait "$pending_request_pid"; then
+    pending_request_pid=''
+    untrap_interrupts
+    status=0
+    output="$(classify_gh_error "$(<"$delete_stderr_file")")" || status=$?
+    rm -f -- "$delete_stderr_file"
+    # An ephemeral runner can deregister between the name check and the request; a 404 here is the same
+    # confirmation the loop below waits for.
+    if (( status == STATUS_ABSENT )); then
+      printf 'Runner %s (%s) is gone from %s: it deregistered before the delete request\n' \
+        "$runner_id" "$actual_name" "$repository"
+      return 0
+    fi
+    die "could not delete runner $runner_id ($actual_name) from $repository: $output"
+  fi
+  pending_request_pid=''
+  rm -f -- "$delete_stderr_file"
+  deletion_state="GitHub accepted $deletion, but confirmation was interrupted; $gone_hint"
+
+  for (( attempt = 1; attempt <= DELETE_CONFIRM_ATTEMPTS; attempt++ )); do
+    (( attempt == 1 )) || sleep "$DELETE_CONFIRM_INTERVAL_SECONDS"
+    status=0
+    output="$(lookup_runner "$repository" "$runner_id" '.name')" || status=$?
+    case "$status" in
+      "$STATUS_ABSENT")
+        untrap_interrupts
+        printf 'Deleted runner %s (%s) from %s\n' "$runner_id" "$actual_name" "$repository"
+        return 0
+        ;;
+      0) reason='GitHub still returns the runner' ;;
+      *) reason="the confirmation request failed: $output" ;;
+    esac
+  done
+
+  untrap_interrupts
+  die "GitHub accepted $deletion, but $reason; $gone_hint"
+}
+
+require_command gh
+
+repository=''
+repository_source=''
+if [[ "${1:-}" == '--repo' ]]; then
+  [[ $# -ge 3 ]] || usage_error
+  repository="$2"
+  repository_source='--repo'
+  shift 2
+elif [[ -n "${GH_REPO+set}" ]]; then
+  repository="$GH_REPO"
+  repository_source='GH_REPO'
+fi
+
+command="${1:-}"
+[[ -n "$command" ]] || usage_error
+shift
+
+case "$command" in
+  auth|permission|list|registration-token-file|remove-token-file|runs)
+    require_arg_count 0 "$@"
+    ;;
+  with-registration-token|with-remove-token)
+    [[ $# -ge 1 ]] || usage_error
+    ;;
+  get)
+    require_arg_count 1 "$@"
+    runner_id="$(positive_integer "$1" 'runner ID' "$MAX_ID")"
+    require_command jq
+    ;;
+  check)
+    [[ $# -eq 2 || $# -eq 4 ]] || usage_error
+    runner_id="$(positive_integer "$1" 'runner ID' "$MAX_ID")"
+    runner_mode="$(validate_mode "$2")"
+    run_id=''
+    runner_name=''
+    if [[ $# -eq 4 ]]; then
+      run_id="$(positive_integer "$3" 'run ID' "$MAX_ID")"
+      runner_name="$4"
+      [[ -n "$runner_name" ]] || argument_error 'runner name must not be empty'
+    fi
+    require_command jq
+    ;;
+  jobs)
+    require_arg_count 1 "$@"
+    run_id="$(positive_integer "$1" 'run ID' "$MAX_ID")"
+    ;;
+  dispatch-run)
+    [[ $# -ge 2 ]] || usage_error
+    workflow="$(validate_workflow "$1")"
+    ref="$(validate_ref "$2")"
+    for input in "${@:3}"; do
+      validate_input "$input"
+    done
+    require_marker_input "${@:3}"
+    require_command jq
+    ;;
+  run-for-commit)
+    [[ $# -ge 2 && $# -le 3 ]] || usage_error
+    workflow="$(validate_workflow "$1")"
+    head_sha="$(validate_head_sha "$2")"
+    event=''
+    [[ $# -lt 3 ]] || event="$(validate_event "$3")"
+    require_command jq
+    ;;
+  wait-assignment)
+    [[ $# -ge 3 && $# -le 4 ]] || usage_error
+    runner_id="$(positive_integer "$1" 'runner ID' "$MAX_ID")"
+    runner_name="$2"
+    [[ -n "$runner_name" ]] || argument_error 'runner name must not be empty'
+    run_id="$(positive_integer "$3" 'run ID' "$MAX_ID")"
+    timeout_seconds="$(positive_integer "${4-$DEFAULT_TIMEOUT_SECONDS}" 'timeout' "$MAX_TIMEOUT_SECONDS")"
+    require_command jq
+    ;;
+  delete)
+    require_arg_count 2 "$@"
+    runner_id="$(positive_integer "$1" 'runner ID' "$MAX_ID")"
+    runner_name="$2"
+    [[ -n "$runner_name" ]] || argument_error 'expected runner name must not be empty'
+    require_command jq
+    ;;
+  *)
+    usage_error
+    ;;
+esac
+
+if [[ "$command" == 'auth' ]]; then
+  gh auth status
+  exit 0
+fi
+
+require_explicit_repository "$repository" "$repository_source"
+STOP_GRACE_SECONDS="$(stop_grace_seconds)"
+readonly STOP_GRACE_SECONDS
+require_admin "$repository"
+
+case "$command" in
+  permission) printf 'ADMIN\n' ;;
+  list) list_runners "$repository" ;;
+  get) get_runner "$repository" "$runner_id" ;;
+  check) check_runner "$repository" "$runner_id" "$runner_mode" "$run_id" "$runner_name" ;;
+  registration-token-file) print_token_file "$repository" 'registration-token' ;;
+  remove-token-file) print_token_file "$repository" 'remove-token' ;;
+  with-registration-token) run_with_token_file "$repository" 'registration-token' "$@" ;;
+  with-remove-token) run_with_token_file "$repository" 'remove-token' "$@" ;;
+  runs) list_runs "$repository" ;;
+  jobs) list_jobs "$repository" "$run_id" ;;
+  dispatch-run) dispatch_run "$repository" "$workflow" "$ref" "${@:3}" ;;
+  run-for-commit) run_for_commit "$repository" "$workflow" "$head_sha" "$event" ;;
+  wait-assignment) wait_for_assignment "$repository" "$runner_id" "$runner_name" "$run_id" "$timeout_seconds" ;;
+  delete) delete_runner "$repository" "$runner_id" "$runner_name" ;;
+  *) die "unhandled command: $command" ;;
+esac

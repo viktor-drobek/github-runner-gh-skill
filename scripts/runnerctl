@@ -1,0 +1,899 @@
+#!/usr/bin/env bash
+# Reference manager for one repository-level GitHub Actions runner in a Docker container, supervised by a
+# systemd user unit. Every GitHub interaction goes through scripts/github-runner-gh; tokens reach the
+# container only as a read-only mounted file. Linux only: it relies on /proc/uptime, flock, timeout, and
+# systemd-notify.
+set -euo pipefail
+shopt -s globasciiranges
+
+readonly RUNNERCTL_VERSION=1
+# Stop-path budgets in seconds; a documentation test checks that they sum to STOP_BUDGET_SECONDS.
+readonly STOP_CONTAINER_BUDGET_SECONDS=21
+readonly STOP_CONTAINER_GRACE_SECONDS=15
+readonly REMOVE_TOKEN_BUDGET_SECONDS=24
+# Every helper call in the stop path gets this grace: the helper starts its own TERM-to-KILL grace only when
+# timeout sends TERM, and waits up to as long again for the group to go; both must end before timeout's KILL,
+# so twice this value stays below KILL_GRACE_SECONDS.
+readonly HELPER_GRACE_SECONDS=1
+readonly GET_BUDGET_SECONDS=8
+readonly DELETE_BUDGET_SECONDS=12
+readonly RM_BUDGET_SECONDS=5
+readonly VOLUME_RM_BUDGET_SECONDS=5
+# Ownership checks (docker ps, docker volume inspect) are bounded too; they take from the deadline, not from the sum.
+readonly CHECK_BUDGET_SECONDS=5
+readonly STOP_BUDGET_SECONDS=75
+readonly KILL_GRACE_SECONDS=3
+readonly READY_BUDGET_SECONDS=120
+# Every docker call that sets the listener up (info, inspect, create, start) is bounded too, so a hanging
+# daemon cannot hold run in a foreground command where a stop signal would wait.
+readonly SETUP_BUDGET_SECONDS=30
+readonly WAIT_STOP_GRACE_SECONDS=2
+readonly LISTENING_LINE='Listening for Jobs'
+readonly LABEL_KEY='runnerctl.slug'
+usage() {
+  cat <<USAGE
+Usage:
+  runnerctl register --repo OWNER/REPOSITORY --labels LABELS --image IMAGE [--ephemeral] [--token-file PATH]
+                     [--seccomp FILE] [--require-userns] [--slug SLUG]
+  runnerctl run SLUG
+  runnerctl verify SLUG RUN_ID
+  runnerctl remove SLUG [--token-file PATH]
+  runnerctl reconcile SLUG
+  runnerctl status SLUG
+
+register prints the SLUG of the new registration, which names its container, volume, state, and unit instance.
+The token file comes from --token-file or GITHUB_RUNNER_TOKEN_FILE, as with-registration-token and
+with-remove-token hand it over; it is mounted read-only into the configuration container and never copied.
+State lives in RUNNERCTL_STATE_DIR (default \${XDG_STATE_HOME:-~/.local/state}/runnerctl).
+The helper is GITHUB_RUNNER_GH (default: github-runner-gh next to this script).
+run supervises the listener container as a systemd notify service: READY=1 after "$LISTENING_LINE", and on HUP,
+INT, or TERM the bounded stop path (STOP_BUDGET_SECONDS s at most) before it exits. verify RUN_ID records the
+helper's wait-assignment evidence in the state; an ephemeral run without it exits 3 after its cleanup, and
+run exits 4 when the registration does not exist; the unit does not restart on 3 or 4.
+USAGE
+}
+
+die() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+usage_error() {
+  usage >&2
+  exit 2
+}
+
+argument_error() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but not found on PATH"
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly HELPER="${GITHUB_RUNNER_GH:-$script_dir/github-runner-gh}"
+readonly STATE_DIR="${RUNNERCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/runnerctl}"
+# /proc/uptime is monotonic; the override exists for the component tests, which drive it with a fake clock.
+readonly UPTIME_FILE="${RUNNERCTL_UPTIME_FILE:-/proc/uptime}"
+
+# Prints whole seconds of a monotonic clock.
+now_seconds() {
+  local first
+
+  read -r first _ <"$UPTIME_FILE" || die "cannot read $UPTIME_FILE"
+  printf '%s\n' "${first%%.*}"
+}
+
+# Runs COMMAND with a budget: TERM to its process group KILL_GRACE_SECONDS before the budget ends and KILL
+# when it ends, so a command that ignores TERM cannot overrun the phase. Returns the command's status, 124
+# when TERM ended it, or 137 when KILL was needed (coreutils timeout, GNU or uutils, reports both this way).
+run_bounded() {
+  local budget="$1"
+  shift
+
+  (( budget > KILL_GRACE_SECONDS )) || die "budget of ${budget}s leaves no room for the kill grace"
+  timeout --kill-after="$KILL_GRACE_SECONDS" "$(( budget - KILL_GRACE_SECONDS ))" "$@"
+}
+
+validate_slug() {
+  [[ -n "$1" && "$1" != *[!A-Za-z0-9._-]* ]] || argument_error "SLUG must be one word of letters, digits, '.', '_', and '-', not '$1'"
+  printf '%s\n' "$1"
+}
+
+# Images are pinned by digest: a tag alone can change under the registration.
+validate_image() {
+  local digest="${1##*@sha256:}"
+
+  [[ "$1" == *@sha256:* && ${#digest} -eq 64 && "$digest" != *[!0-9a-f]* ]] \
+    || argument_error "image must be pinned by digest (NAME:TAG@sha256:<64 hex digits>), not '$1'"
+  printf '%s\n' "$1"
+}
+
+validate_repository() {
+  [[ "$1" == +([A-Za-z0-9._-])/+([A-Za-z0-9._-]) ]] || argument_error "repository must be OWNER/REPOSITORY, not '$1'"
+  printf '%s\n' "$1"
+}
+
+positive_integer() {
+  local value="$1"
+  local label="$2"
+
+  [[ -n "$value" && "$value" != *[!0-9]* ]] || argument_error "$label must be a positive integer"
+  value="${value#"${value%%[!0]*}"}"
+  [[ -n "$value" ]] || argument_error "$label must be greater than zero"
+  printf '%s\n' "$value"
+}
+
+state_file() {
+  printf '%s/%s.json\n' "$STATE_DIR" "$1"
+}
+
+container_name() {
+  printf 'gha-%s\n' "$1"
+}
+
+volume_name() {
+  printf 'gha-%s-runner\n' "$1"
+}
+
+# The state lock is held for one read or transition; the run lock for the whole of `run`.
+with_state_lock() {
+  local slug="$1"
+  shift
+  local lock_fd
+
+  mkdir -p "$STATE_DIR"
+  exec {lock_fd}>"$STATE_DIR/$slug.state.lock"
+  flock "$lock_fd"
+  "$@"
+  local status=$?
+  exec {lock_fd}>&-
+  return "$status"
+}
+
+take_run_lock() {
+  local slug="$1"
+
+  mkdir -p "$STATE_DIR"
+  exec {run_lock_fd}>"$STATE_DIR/$slug.run.lock"
+  flock -n "$run_lock_fd" || die "run holds the registration $slug; stop the service instead"
+}
+
+run_lock_held() {
+  local slug="$1"
+  local fd
+
+  [[ -e "$STATE_DIR/$slug.run.lock" ]] || return 1
+  exec {fd}>"$STATE_DIR/$slug.run.lock"
+  if flock -n "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  exec {fd}>&-
+  return 0
+}
+
+# Reads one field of the state file, or the empty string.
+state_get() {
+  local slug="$1"
+  local field="$2"
+  local file
+
+  file="$(state_file "$slug")"
+  [[ -f "$file" ]] || die "no registration $slug in $STATE_DIR"
+  jq -r --arg field "$field" '.[$field] // empty' "$file"
+}
+
+# Writes a state transition under the state lock, held for the write only: the whole file is replaced
+# atomically with the given fields merged in, and never holds a token.
+state_set() {
+  with_state_lock "$1" state_set_unlocked "$@"
+}
+
+state_set_unlocked() {
+  local slug="$1"
+  shift
+  local file tmp previous_umask
+
+  file="$(state_file "$slug")"
+  mkdir -p "$STATE_DIR"
+  previous_umask="$(umask)"
+  umask 077
+  tmp="$(mktemp "$STATE_DIR/.$slug.XXXXXX")"
+  umask "$previous_umask"
+  if [[ -f "$file" ]]; then
+    jq "$@" '. + $ARGS.named' "$file" >"$tmp"
+  else
+    jq -n "$@" '$ARGS.named' >"$tmp"
+  fi
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$file"
+}
+
+# Appends a phase record to the state's phase log, under the state lock for the write only.
+log_phase() {
+  with_state_lock "$1" log_phase_unlocked "$@"
+}
+
+log_phase_unlocked() {
+  local slug="$1"
+  local phase="$2"
+  local started="$3"
+  local ended="$4"
+  local result="$5"
+  local file tmp
+
+  file="$(state_file "$slug")"
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "$STATE_DIR/.$slug.XXXXXX")"
+  jq --arg phase "$phase" --argjson started "$started" --argjson ended "$ended" --arg result "$result" \
+    '.phases = ((.phases // []) + [{phase: $phase, started: $started, ended: $ended, result: $result}])' "$file" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$file"
+}
+
+# Reads a state field under the state lock, so a read never interleaves with a transition.
+state_read() {
+  with_state_lock "$1" state_get "$1" "$2"
+}
+
+# Prints the whole state file under the state lock: one consistent snapshot for commands that read several
+# fields. Fails when the registration does not exist.
+state_snapshot() {
+  with_state_lock "$1" state_snapshot_unlocked "$1"
+}
+
+state_snapshot_unlocked() {
+  local file
+
+  file="$(state_file "$1")"
+  [[ -f "$file" ]] || die "no registration $1 in $STATE_DIR"
+  cat "$file"
+}
+
+# Reads a field from a snapshot printed by state_snapshot.
+snapshot_get() {
+  jq -r --arg field "$2" '.[$field] // empty' <<<"$1"
+}
+
+# Runs one stop-path phase within the smaller of its own budget and what is left of the whole stop budget
+# (stop_deadline, set by stop_path): records its start and end on the monotonic clock and its result. A
+# phase with no usable budget left is recorded as skipped and fails with status 125.
+phase() {
+  local slug="$1"
+  local name="$2"
+  local budget="$3"
+  shift 3
+  local started ended status=0 remaining
+
+  started="$(now_seconds)"
+  if [[ -n "${stop_deadline:-}" ]]; then
+    remaining=$(( stop_deadline - started ))
+    (( remaining < budget )) && budget="$remaining"
+  fi
+  if (( budget <= KILL_GRACE_SECONDS )); then
+    log_phase "$slug" "$name" "$started" "$started" skipped
+    return 125
+  fi
+  run_bounded "$budget" "$@" || status=$?
+  ended="$(now_seconds)"
+  log_phase "$slug" "$name" "$started" "$ended" "$status"
+  return "$status"
+}
+
+helper() {
+  "$HELPER" --repo "$repository" "$@"
+}
+
+# The token file the helper hands over: --token-file, else GITHUB_RUNNER_TOKEN_FILE. It is read once, by
+# the docker client running as this user, to feed the configuration container's standard input; it is
+# never copied and never mounted, since the container's user cannot read a 0600 file of another uid.
+resolve_token_file() {
+  local path="${1:-${GITHUB_RUNNER_TOKEN_FILE:-}}"
+
+  [[ -n "$path" ]] || argument_error 'a token file is required: --token-file PATH or GITHUB_RUNNER_TOKEN_FILE'
+  [[ -f "$path" && -r "$path" ]] || die "token file $path is not a readable file"
+  printf '%s\n' "$path"
+}
+
+# In-container wrapper for config.sh: the token arrives on standard input, is read into a variable, and is
+# answered to config.sh's prompt through a pseudo-terminal that script provides with echo off, because the
+# runner reads the prompt with a console API that rejects redirected input and takes --token only as an
+# argument, which would expose it, and because script's default echo would copy the typed token into its
+# output before config.sh disables echo. The token never becomes an argument, an environment value, or a
+# file inside the container; the wrapper's own text carries no secret.
+readonly CONFIG_WRAPPER='set -eu; set +x
+IFS= read -r token || [[ -n "${token:-}" ]]
+[[ -n "$token" ]] || { echo "empty token on standard input" >&2; exit 1; }
+printf "%s\n" "$token" | exec script -q -e --echo never -c "$(printf "%q " "$@")" /dev/null'
+
+# Runs config.sh (with ARGS) inside a short-lived container against the registration's volume, the token
+# file's content on the container's standard input: the docker client reads the 0600 file as this user
+# and hands it over through its attach stream, so no mount, argument, or environment value carries it.
+configure_in_container() {
+  local slug="$1"
+  local token_file="$2"
+  local suffix="$3"
+  shift 3
+  local image
+
+  image="$(state_read "$slug" image)"
+  docker run --rm -i --name "$(container_name "$slug")-$suffix" --label "$LABEL_KEY=$slug" \
+    --mount "type=volume,src=$(volume_name "$slug"),dst=/home/runner" \
+    --cap-drop ALL --user runner "$image" bash -c "$CONFIG_WRAPPER" runner-config ./config.sh "$@" <"$token_file"
+}
+
+# Prints a field of the .runner file the configuration wrote into the volume.
+runner_file_field() {
+  local slug="$1"
+  local filter="$2"
+  local image
+
+  image="$(state_read "$slug" image)"
+  docker run --rm --label "$LABEL_KEY=$slug" --mount "type=volume,src=$(volume_name "$slug"),dst=/home/runner" \
+    --cap-drop ALL --user runner "$image" cat .runner </dev/null | jq -r "$filter"
+}
+
+new_slug() {
+  local repository="$1"
+  local owner="${repository%%/*}" name="${repository#*/}" random
+
+  random="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s-%s-%s\n' "${owner:0:20}" "${name:0:20}" "$random"
+}
+
+# Deletes the registration by ID and exact name through the helper when the state has an ID; returns
+# non-zero when the helper could not delete or confirm it.
+delete_registration_through_helper() {
+  local slug="$1"
+  local runner_id name output status=0
+
+  runner_id="$(state_get "$slug" runner_id)"
+  name="$(state_get "$slug" name)"
+  [[ -n "$runner_id" ]] || return 0
+  output="$(helper delete "$runner_id" "$name" 2>&1)" || status=$?
+  (( status != 0 )) || return 0
+  # The helper's own lookup answering 404 means the registration is already gone.
+  [[ "$output" != *'GitHub answers 404'* ]] || return 0
+  printf '%s\n' "$output" >&2
+  return 1
+}
+
+cmd_register() {
+  local repository="$1"
+  local labels="$2"
+  local mode="$3"
+  local token_file="$4"
+  local image="$5"
+  local slug="${6:-}"
+  local seccomp="${7:-}"
+  local require_userns="${8:-false}"
+  local name flags=() ephemeral_in_file runner_id status=0 lookup
+
+  [[ -n "$slug" ]] || slug="$(new_slug "$repository")"
+  [[ ! -f "$(state_file "$slug")" ]] || die "registration $slug already exists in $STATE_DIR"
+  name="$slug"
+  state_set "$slug" --arg repository "$repository" --arg name "$name" --arg mode "$mode" --arg image "$image" \
+    --arg labels "$labels" --arg container "$(container_name "$slug")" --arg volume "$(volume_name "$slug")" \
+    --arg seccomp "$seccomp" --arg require_userns "$require_userns" \
+    --arg state registering --argjson registered_at "$(now_seconds)"
+  docker volume create --label "$LABEL_KEY=$slug" "$(volume_name "$slug")" >/dev/null
+  [[ "$mode" != 'ephemeral' ]] || flags=(--ephemeral)
+  if ! configure_in_container "$slug" "$token_file" config --url "https://github.com/$repository" --name "$name" \
+      --labels "$labels" --work _work --runnergroup Default --replace --disableupdate "${flags[@]}"; then
+    # config.sh may have registered with GitHub before it failed: .runner then names the ID, and the
+    # registration is deleted by that ID and the exact name; the volume goes only once GitHub confirmed.
+    runner_id="$(runner_file_field "$slug" '.agentId // empty | tostring' 2>/dev/null || :)"
+    if [[ -n "$runner_id" ]]; then
+      state_set "$slug" --arg runner_id "$runner_id" --arg state incomplete
+      if delete_registration_through_helper "$slug"; then
+        docker volume rm "$(volume_name "$slug")" >/dev/null 2>&1 || :
+        state_set "$slug" --arg state failed
+        die "config.sh failed for $slug after registering runner $runner_id; the registration was deleted by ID and name and the volume was removed"
+      fi
+      die "config.sh failed for $slug after registering runner $runner_id, which could not be deleted; the state is incomplete for reconcile"
+    fi
+    docker volume rm "$(volume_name "$slug")" >/dev/null 2>&1 || :
+    state_set "$slug" --arg state failed
+    die "config.sh failed for $slug; nothing was registered and the volume was removed"
+  fi
+  ephemeral_in_file="$(runner_file_field "$slug" '(.ephemeral // false) | tostring')"
+  runner_id="$(runner_file_field "$slug" '.agentId | tostring')"
+  state_set "$slug" --arg runner_id "$runner_id" --arg state incomplete
+  if [[ "$mode" == 'ephemeral' && "$ephemeral_in_file" != 'true' ]] || [[ "$mode" == 'persistent' && "$ephemeral_in_file" != 'false' ]]; then
+    if delete_registration_through_helper "$slug"; then
+      state_set "$slug" --arg state failed
+      die "runner $runner_id ($name) was configured with ephemeral=$ephemeral_in_file, not as the declared $mode; the registration was deleted by ID and name"
+    fi
+    die "runner $runner_id ($name) was configured with ephemeral=$ephemeral_in_file, not as the declared $mode, and could not be deleted; the state is incomplete for reconcile"
+  fi
+  lookup="$(helper get "$runner_id" 2>&1)" || status=$?
+  if (( status != 0 )); then
+    die "runner $runner_id ($name) is configured but the helper could not confirm it: ${lookup//$'\n'/; }; the state is incomplete for reconcile"
+  fi
+  [[ "$(printf '%s\n' "$lookup" | cut -f2)" == "$name" ]] \
+    || die "GitHub lists runner $runner_id under another name than $name; the state is incomplete for reconcile"
+  state_set "$slug" --arg state registered
+  printf '%s\n' "$slug"
+}
+
+# Runs config.sh remove against the registration's volume with the removal token file; the internal
+# target of with-remove-token during the stop path, and of remove --token-file.
+cmd_unconfigure() {
+  local slug="$1"
+  local token_file="$2"
+
+  configure_in_container "$slug" "$token_file" remove remove
+}
+
+# Absence of a container or a volume is established by a listing that completed with exit 0 and named
+# nothing, never by parsing an error message: docker's wording differs between versions ("Error: No such
+# object: NAME", "error: no such object: NAME"), and a daemon failure must never look like absence.
+# Prints the state of the registration's container ("absent", "created", "running", "exited", ...) or
+# "unknown" when the bounded listing did not complete.
+container_state() {
+  local slug="$1"
+  local container output status=0
+
+  container="$(container_name "$slug")"
+  output="$(run_bounded "$CHECK_BUDGET_SECONDS" docker ps -a --filter "name=^${container}\$" --format '{{.State}}' 2>/dev/null)" || status=$?
+  if (( status != 0 )); then
+    printf 'unknown\n'
+  elif [[ -z "$output" ]]; then
+    printf 'absent\n'
+  else
+    printf '%s\n' "${output%%$'\n'*}"
+  fi
+}
+
+# Containers of the registration that are running: the manager's own listener or an external restart. The
+# listing is bounded and recorded as a phase; only a listing that completed is trusted. Anything else, a
+# timeout or a daemon that did not answer, prints "unknown", which callers treat as a reason to stop rather
+# than to proceed.
+running_owned_containers() {
+  local slug="$1"
+  local output status=0
+
+  output="$(phase "$slug" check-containers "$CHECK_BUDGET_SECONDS" \
+    docker ps --filter "label=$LABEL_KEY=$slug" --filter status=running --format '{{.Names}}' 2>/dev/null)" || status=$?
+  if (( status != 0 )); then
+    printf 'unknown\n'
+    return 0
+  fi
+  printf '%s\n' "$output"
+}
+
+# The state of the registration's volume: "owned" (listed, with the registration's label), "absent" (the
+# bounded listing completed and named nothing), "foreign" (listed without the label: replaced by something
+# the manager does not own and must not remove), or "unknown" when a bounded call did not complete.
+owned_volume_state() {
+  local slug="$1"
+  local volume output label status=0
+
+  volume="$(volume_name "$slug")"
+  output="$(phase "$slug" check-volume "$CHECK_BUDGET_SECONDS" \
+    docker volume ls --filter "name=^${volume}\$" --format '{{.Name}}' 2>/dev/null)" || status=$?
+  if (( status != 0 )); then
+    printf 'unknown\n'
+    return 0
+  fi
+  if [[ -z "$output" ]]; then
+    printf 'absent\n'
+    return 0
+  fi
+  label="$(phase "$slug" check-volume-label "$CHECK_BUDGET_SECONDS" \
+    docker volume inspect --format "{{index .Labels \"$LABEL_KEY\"}}" "$volume" 2>/dev/null)" || status=$?
+  if (( status != 0 )); then
+    printf 'unknown\n'
+  elif [[ "$label" == "$slug" ]]; then
+    printf 'owned\n'
+  else
+    printf 'foreign\n'
+  fi
+}
+
+# The stop path, shared by remove and by run's signal handling: stop the listener, hand the removal token to
+# config.sh remove (persistent only), confirm or delete the registration through the helper, and remove
+# the container and volume. Each phase is bounded and recorded. Returns 0 when GitHub confirmed the removal
+# (404 or a confirmed deletion) and the local objects are gone; otherwise the state is left as incomplete for
+# reconcile and the status is 1.
+stop_path() {
+  local slug="$1"
+  local token_file="${2:-}"
+  local skip_unconfigure="${3:-}"
+  local mode container volume runner_id name output status=0 confirmed=false running volume_state snapshot
+
+  snapshot="$(state_snapshot "$slug")"
+  mode="$(snapshot_get "$snapshot" mode)"
+  container="$(container_name "$slug")"
+  volume="$(volume_name "$slug")"
+  runner_id="$(snapshot_get "$snapshot" runner_id)"
+  name="$(snapshot_get "$snapshot" name)"
+  state_set "$slug" --arg state stopping
+  # Every phase is bounded by its own budget and by what is left of this deadline, so the whole path ends
+  # within STOP_BUDGET_SECONDS whatever the phases do.
+  stop_deadline=$(( $(now_seconds) + STOP_BUDGET_SECONDS ))
+  phase "$slug" stop-container "$STOP_CONTAINER_BUDGET_SECONDS" \
+    docker stop --time "$STOP_CONTAINER_GRACE_SECONDS" "$container" >/dev/null 2>&1 || :
+  # An external start of the container during the stop path is unsupported and detected: once it is stopped
+  # again within the remaining budget, twice it ends the path.
+  running="$(running_owned_containers "$slug")"
+  if [[ "$running" == 'unknown' ]]; then
+    state_set "$slug" --arg state incomplete
+    printf 'Error: the containers of %s could not be listed in time; the registration is left for reconcile\n' "$slug" >&2
+    return 1
+  fi
+  if [[ -n "$running" ]]; then
+    phase "$slug" stop-container-again "$STOP_CONTAINER_BUDGET_SECONDS" docker stop --time "$STOP_CONTAINER_GRACE_SECONDS" "$container" >/dev/null 2>&1 || :
+    running="$(running_owned_containers "$slug")"
+    if [[ -n "$running" ]]; then
+      state_set "$slug" --arg state incomplete
+      printf 'Error: container %s was started again during the stop path; the registration is left for reconcile\n' "$running" >&2
+      return 1
+    fi
+  fi
+  volume_state="$(owned_volume_state "$slug")"
+  if [[ "$volume_state" == 'unknown' ]]; then
+    state_set "$slug" --arg state incomplete
+    printf 'Error: the volume %s could not be inspected in time; the registration is left for reconcile\n' "$volume" >&2
+    return 1
+  fi
+  [[ "$volume_state" == 'owned' ]] || printf 'Warning: the volume %s is %s; the registration is still removed from GitHub\n' "$volume" "$volume_state" >&2
+  if [[ "$mode" == 'persistent' && -n "$runner_id" && -z "$skip_unconfigure" ]]; then
+    if [[ -n "$token_file" ]]; then
+      phase "$slug" remove-token "$REMOVE_TOKEN_BUDGET_SECONDS" "$0" unconfigure "$slug" --token-file "$token_file" || :
+    else
+      phase "$slug" remove-token "$REMOVE_TOKEN_BUDGET_SECONDS" env GITHUB_RUNNER_GH_STOP_GRACE_SECONDS="$HELPER_GRACE_SECONDS" \
+        "$HELPER" --repo "$repository" with-remove-token "$0" unconfigure "$slug" --token-file '{}' || :
+    fi
+  fi
+  if [[ -n "$runner_id" ]]; then
+    output="$(phase "$slug" get "$GET_BUDGET_SECONDS" env GITHUB_RUNNER_GH_STOP_GRACE_SECONDS="$HELPER_GRACE_SECONDS" \
+      "$HELPER" --repo "$repository" get "$runner_id" 2>&1)" || status=$?
+    if (( status == 0 )); then
+      if [[ "$(printf '%s\n' "$output" | cut -f2)" == "$name" ]]; then
+        if phase "$slug" delete "$DELETE_BUDGET_SECONDS" env GITHUB_RUNNER_GH_STOP_GRACE_SECONDS="$HELPER_GRACE_SECONDS" \
+            "$HELPER" --repo "$repository" delete "$runner_id" "$name" >/dev/null 2>&1; then
+          confirmed=true
+        fi
+      else
+        printf 'Error: GitHub lists runner %s under another name than %s; it is left alone\n' "$runner_id" "$name" >&2
+      fi
+    elif [[ "$output" == *'GitHub answers 404'* ]]; then
+      confirmed=true
+    else
+      printf 'Error: the registration of runner %s could not be confirmed: %s\n' "$runner_id" "${output//$'\n'/; }" >&2
+    fi
+  else
+    confirmed=true
+  fi
+  phase "$slug" rm "$RM_BUDGET_SECONDS" docker rm "$container" >/dev/null 2>&1 || :
+  if [[ "$confirmed" == true ]]; then
+    running="$(running_owned_containers "$slug")"
+    [[ -z "$running" ]] || { state_set "$slug" --arg state incomplete; printf 'Error: container %s is running again or could not be listed in time; the volume is kept for reconcile\n' "$running" >&2; return 1; }
+    case "$(owned_volume_state "$slug")" in
+      unknown)
+        state_set "$slug" --arg state incomplete
+        printf 'Error: the volume %s could not be inspected in time; it is kept for reconcile\n' "$volume" >&2
+        return 1
+        ;;
+      owned)
+        phase "$slug" volume-rm "$VOLUME_RM_BUDGET_SECONDS" docker volume rm "$volume" >/dev/null 2>&1 \
+          || { state_set "$slug" --arg state incomplete; printf 'Error: the volume %s could not be removed in time; the registration is left for reconcile\n' "$volume" >&2; return 1; }
+        ;;
+      absent) ;;
+      foreign)
+        state_set "$slug" --arg state incomplete
+        printf 'Error: the volume %s does not carry the label of %s any more; it is left alone and the registration is left for reconcile\n' "$volume" "$slug" >&2
+        return 1
+        ;;
+    esac
+    with_state_lock "$slug" rm -f -- "$(state_file "$slug")"
+    return 0
+  fi
+  state_set "$slug" --arg state incomplete
+  return 1
+}
+
+# Sends a systemd notification when running under systemd; a no-op elsewhere.
+notify() {
+  [[ -z "${NOTIFY_SOCKET:-}" ]] || systemd-notify "$@" || :
+}
+
+stop_requested=0
+on_stop_signal() {
+  stop_requested=1
+}
+
+# After each bounded setup call of run: a stop that arrived meanwhile goes to the stop path; a failed call
+# ends run with status 1 for the unit to retry, the registration untouched.
+setup_checkpoint() {
+  local slug="$1"
+  local failed="$2"
+
+  if (( stop_requested )); then
+    notify --stopping
+    stop_path "$slug" && exit 0
+    exit 1
+  fi
+  [[ -z "$failed" ]] || die "$failed did not complete within ${SETUP_BUDGET_SECONDS}s or failed; the registration $slug is left as it is for the unit to retry"
+}
+
+# Stops the background docker wait: TERM, then KILL after a short grace, and reaps it.
+stop_wait_process() {
+  local pid="$1"
+
+  kill -TERM "$pid" 2>/dev/null || :
+  ( sleep "$WAIT_STOP_GRACE_SECONDS"; kill -KILL "$pid" 2>/dev/null ) 2>/dev/null &
+  wait "$pid" 2>/dev/null || :
+  kill "$!" 2>/dev/null || :
+  wait "$!" 2>/dev/null || :
+}
+
+# The supervised life of the listener: create and start the container, wait for readiness, then wait on
+# docker wait in the background so a signal reaches the trap at once and runs the stop path.
+cmd_run() {
+  local slug="$1"
+  local state mode container volume image seccomp require_userns wait_out wait_pid ready_pid status=0 exit_code evidence snapshot output setup_failed=''
+  local security=()
+
+  take_run_lock "$slug"
+  # Exit status 4 tells the unit (RestartPreventExitStatus) not to restart: there is nothing to run until
+  # the operator registers again.
+  [[ -f "$(state_file "$slug")" ]] || { printf 'Error: no registration %s in %s; register again before starting the unit\n' "$slug" "$STATE_DIR" >&2; exit 4; }
+  snapshot="$(state_snapshot "$slug")"
+  state="$(snapshot_get "$snapshot" state)"
+  case "$state" in
+    registered|running|exited) ;;
+    incomplete) die "registration $slug is incomplete; run reconcile first" ;;
+    *) die "registration $slug is in state $state and cannot run" ;;
+  esac
+  repository="$(snapshot_get "$snapshot" repository)"
+  mode="$(snapshot_get "$snapshot" mode)"
+  container="$(container_name "$slug")"
+  volume="$(volume_name "$slug")"
+  image="$(snapshot_get "$snapshot" image)"
+  seccomp="$(snapshot_get "$snapshot" seccomp)"
+  require_userns="$(snapshot_get "$snapshot" require_userns)"
+  [[ -z "$seccomp" ]] || security+=(--security-opt "seccomp=$seccomp")
+  # The trap is set before any docker call, and every setup call is bounded, so a signal during setup waits
+  # at most one bounded call and then ends in the stop path, which stops whatever did start. A setup call that
+  # fails or hangs without a stop request ends run with status 1 and leaves the registration as it is: the
+  # unit retries, and nothing is deregistered because a daemon did not answer once.
+  trap on_stop_signal HUP INT TERM
+  if [[ "$require_userns" == 'true' ]]; then
+    output="$(run_bounded "$SETUP_BUDGET_SECONDS" docker info --format '{{.SecurityOptions}}' 2>/dev/null)" || setup_failed="docker info"
+    setup_checkpoint "$slug" "$setup_failed"
+    [[ "$output" == *'name=userns'* ]] \
+      || die "the image policy of $slug requires user-namespace remapping, which this Docker daemon does not report"
+  fi
+  output="$(container_state "$slug")"
+  case "$output" in
+    unknown) setup_failed="docker ps" ;;
+    running) die "container $container is already running" ;;
+  esac
+  setup_checkpoint "$slug" "$setup_failed"
+  if [[ "$output" == 'absent' ]]; then
+    run_bounded "$SETUP_BUDGET_SECONDS" docker create --name "$container" --label "$LABEL_KEY=$slug" \
+      --mount "type=volume,src=$volume,dst=/home/runner" --cap-drop ALL --user runner "${security[@]}" "$image" ./run.sh >/dev/null \
+      || setup_failed="docker create"
+    setup_checkpoint "$slug" "$setup_failed"
+  fi
+  run_bounded "$SETUP_BUDGET_SECONDS" docker start "$container" >/dev/null || setup_failed="docker start"
+  setup_checkpoint "$slug" "$setup_failed"
+  state_set "$slug" --arg state running
+  # The readiness wait runs in the background so a signal reaches the trap at once instead of after the
+  # wait. timeout is started directly, so $! is timeout itself: it forwards TERM to the command's group,
+  # which it owns, and ends the wait.
+  # Inside, the log follower feeds grep through a process substitution and is killed as soon as the line has
+  # been seen; a plain pipeline would wait for the follower, which an idle listener never ends.
+  timeout --kill-after="$KILL_GRACE_SECONDS" "$(( READY_BUDGET_SECONDS - KILL_GRACE_SECONDS ))" \
+    bash -c 'exec {fd}< <(docker logs --follow "$1" 2>&1); follower=$!
+      grep -m1 -F -- "$2" <&"$fd" >/dev/null; status=$?
+      kill -TERM "$follower" 2>/dev/null || :; wait "$follower" 2>/dev/null || :; exit "$status"' \
+    readiness "$container" "$LISTENING_LINE" &
+  ready_pid=$!
+  while (( stop_requested == 0 )); do
+    status=0
+    wait "$ready_pid" || status=$?
+    (( status > 128 && stop_requested )) || break
+  done
+  if (( stop_requested )); then
+    kill -TERM "$ready_pid" 2>/dev/null || :
+    wait "$ready_pid" 2>/dev/null || :
+  elif (( status != 0 )); then
+    printf 'Error: the listener of %s did not report "%s" within %ss; stopping it\n' "$slug" "$LISTENING_LINE" "$READY_BUDGET_SECONDS" >&2
+    notify --stopping
+    stop_path "$slug" || :
+    exit 1
+  else
+    notify --ready
+    printf 'runner %s is listening for jobs\n' "$slug"
+  fi
+
+  wait_out="$(mktemp "$STATE_DIR/.$slug.wait.XXXXXX")"
+  docker wait "$container" >"$wait_out" 2>/dev/null &
+  wait_pid=$!
+  while (( stop_requested == 0 )); do
+    status=0
+    wait "$wait_pid" || status=$?
+    (( status > 128 && stop_requested )) || break
+  done
+  if (( stop_requested )); then
+    stop_wait_process "$wait_pid"
+    rm -f -- "$wait_out"
+    notify --stopping
+    if stop_path "$slug"; then
+      exit 0
+    fi
+    exit 1
+  fi
+  exit_code="$(tr -d '[:space:]' <"$wait_out" 2>/dev/null || :)"
+  rm -f -- "$wait_out"
+  if [[ "$mode" == 'persistent' ]]; then
+    state_set "$slug" --arg state exited --arg exit_code "${exit_code:-unknown}"
+    die "the listener of $slug exited with code ${exit_code:-unknown}; a persistent runner is restarted by its unit"
+  fi
+  # An ephemeral listener ends after its one job (or without one). The evidence recorded by verify is read
+  # from the state under the state lock, so a verify that has just committed counts, before the stop path
+  # confirms or deletes the registration and removes the state.
+  evidence="$(state_read "$slug" assignment)"
+  notify --stopping
+  stop_path "$slug" '' skip-unconfigure || exit 1
+  [[ -z "$evidence" ]] || exit 0
+  printf 'Error: registration %s ended without recorded assignment evidence\n' "$slug" >&2
+  exit 3
+}
+
+# Records the helper's job-assignment evidence for the registration in its state, in one locked transition.
+cmd_verify() {
+  local slug="$1"
+  local run_id="$2"
+  local runner_id name output row
+
+  local snapshot
+  snapshot="$(state_snapshot "$slug")"
+  repository="$(snapshot_get "$snapshot" repository)"
+  runner_id="$(snapshot_get "$snapshot" runner_id)"
+  name="$(snapshot_get "$snapshot" name)"
+  [[ -n "$runner_id" ]] || die "registration $slug has no runner ID yet"
+  output="$(helper wait-assignment "$runner_id" "$name" "$run_id")" || exit 1
+  printf '%s\n' "$output"
+  row="$(printf '%s\n' "$output" | sed -n 2p)"
+  state_set "$slug" --arg assignment "$row" --arg assignment_run_id "$run_id"
+}
+
+# Finishes an interrupted stop or registration: deletes the registration by exact ID and name through the
+# helper when GitHub still lists it, and removes the local objects, without a removal token.
+cmd_reconcile() {
+  local slug="$1"
+  local running
+
+  ! run_lock_held "$slug" || die "run holds the registration $slug; stop the service instead"
+  repository="$(state_read "$slug" repository)"
+  running="$(running_owned_containers "$slug")"
+  [[ "$running" != 'unknown' ]] || die "the containers of $slug could not be listed in time; try again"
+  [[ -z "$running" ]] || die "container $running is running; stop the service instead of reconciling"
+  stop_path "$slug" '' skip-unconfigure
+}
+
+cmd_remove() {
+  local slug="$1"
+  local token_file="${2:-}"
+
+  ! run_lock_held "$slug" || die "run holds the registration $slug; stop the service instead"
+  repository="$(state_read "$slug" repository)"
+  stop_path "$slug" "$token_file"
+}
+
+cmd_status() {
+  local slug="$1"
+  local snapshot state name runner_id mode container inspect helper_output helper_status=0 status
+
+  # One locked snapshot, so a removal that completes meanwhile cannot leave the report half read.
+  snapshot="$(state_snapshot "$slug")"
+  state="$(snapshot_get "$snapshot" state)"
+  name="$(snapshot_get "$snapshot" name)"
+  runner_id="$(snapshot_get "$snapshot" runner_id)"
+  mode="$(snapshot_get "$snapshot" mode)"
+  repository="$(snapshot_get "$snapshot" repository)"
+  container="$(container_name "$slug")"
+  # A bounded listing: an empty one is absence, one that did not complete is unknown.
+  inspect="$(container_state "$slug")"
+  [[ "$inspect" != 'unknown' ]] || inspect="unknown (the container listing did not complete)"
+  printf 'slug\t%s\nrepository\t%s\nrunner_id\t%s\nname\t%s\nmode\t%s\nstate\t%s\ncontainer\t%s\n' \
+    "$slug" "$repository" "$runner_id" "$name" "$mode" "$state" "$inspect"
+  if [[ -n "$runner_id" ]]; then
+    # Bounded like the stop path's lookup, so a hung request cannot hold status.
+    helper_output="$(run_bounded "$GET_BUDGET_SECONDS" "$HELPER" --repo "$repository" get "$runner_id" 2>&1)" || helper_status=$?
+    if (( helper_status == 0 )); then
+      printf 'github\tregistered\n'
+    elif (( helper_status == 124 || helper_status == 137 )); then
+      printf 'github\tunknown (the lookup did not complete within %ss)\n' "$GET_BUDGET_SECONDS"
+    else
+      printf 'github\tcheck failed (%s): %s\n' "$helper_status" "${helper_output//$'\n'/; }"
+    fi
+  fi
+  jq -r '(.phases // [])[] | "phase\t\(.phase)\t\(.started)\t\(.ended)\t\(.result)"' <<<"$snapshot"
+}
+
+main() {
+  local command="${1:-}"
+  local slug='' labels='' mode=persistent token_file='' image='' arg
+  local seccomp='' require_userns=false run_id
+
+  [[ -n "$command" ]] || usage_error
+  shift
+  require_command jq
+  require_command docker
+  require_command flock
+  require_command timeout
+  case "$command" in
+    register)
+      while [[ $# -gt 0 ]]; do
+        arg="$1"
+        shift
+        case "$arg" in
+          --repo) [[ $# -gt 0 ]] || usage_error; repository="$(validate_repository "$1")"; shift ;;
+          --labels) [[ $# -gt 0 ]] || usage_error; labels="$1"; shift ;;
+          --ephemeral) mode=ephemeral ;;
+          --token-file) [[ $# -gt 0 ]] || usage_error; token_file="$1"; shift ;;
+          --image) [[ $# -gt 0 ]] || usage_error; image="$1"; shift ;;
+          --slug) [[ $# -gt 0 ]] || usage_error; slug="$(validate_slug "$1")"; shift ;;
+          --seccomp) [[ $# -gt 0 ]] || usage_error; seccomp="$1"; [[ -f "$seccomp" ]] || argument_error "--seccomp $seccomp is not a file"; shift ;;
+          --require-userns) require_userns=true ;;
+          *) usage_error ;;
+        esac
+      done
+      [[ -n "$repository" ]] || argument_error '--repo OWNER/REPOSITORY is required'
+      [[ -n "$labels" && "$labels" != *[!A-Za-z0-9_,.-]* ]] || argument_error '--labels must be a comma-separated list of custom labels'
+      [[ ",${labels,,}," != *,self-hosted,* ]] || argument_error "self-hosted is GitHub's reserved label and must not be a custom label, in any letter case"
+      [[ -n "$image" ]] || argument_error '--image IMAGE is required'
+      image="$(validate_image "$image")"
+      token_file="$(resolve_token_file "$token_file")"
+      cmd_register "$repository" "$labels" "$mode" "$token_file" "$image" "${slug:-}" "$seccomp" "$require_userns"
+      ;;
+    run)
+      [[ $# -eq 1 ]] || usage_error
+      slug="$(validate_slug "$1")"
+      cmd_run "$slug"
+      ;;
+    verify)
+      [[ $# -eq 2 ]] || usage_error
+      slug="$(validate_slug "$1")"
+      run_id="$(positive_integer "$2" 'RUN_ID')"
+      cmd_verify "$slug" "$run_id"
+      ;;
+    reconcile)
+      [[ $# -eq 1 ]] || usage_error
+      slug="$(validate_slug "$1")"
+      cmd_reconcile "$slug"
+      ;;
+    unconfigure)
+      [[ $# -eq 3 && "$2" == '--token-file' ]] || usage_error
+      slug="$(validate_slug "$1")"
+      token_file="$(resolve_token_file "$3")"
+      repository="$(state_read "$slug" repository)"
+      cmd_unconfigure "$slug" "$token_file"
+      ;;
+    remove)
+      [[ $# -eq 1 || ( $# -eq 3 && "$2" == '--token-file' ) ]] || usage_error
+      slug="$(validate_slug "$1")"
+      [[ $# -lt 3 ]] || token_file="$(resolve_token_file "$3")"
+      [[ -n "$token_file" || -z "${GITHUB_RUNNER_TOKEN_FILE:-}" ]] || token_file="$(resolve_token_file "")"
+      cmd_remove "$slug" "$token_file"
+      ;;
+    status)
+      [[ $# -eq 1 ]] || usage_error
+      slug="$(validate_slug "$1")"
+      cmd_status "$slug"
+      ;;
+    *) usage_error ;;
+  esac
+}
+
+repository=''
+stop_deadline=''
+main "$@"
